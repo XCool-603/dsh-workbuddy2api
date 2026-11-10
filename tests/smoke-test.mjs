@@ -80,11 +80,19 @@ console.log(`   ✓ Loopback 网关成功启动在端口 ${port}，/v1/models �
 
 // 7. 测试 DSH LLM Adapter 生成
 console.log('7. 测试 DSH LLM Seam 适配器构建...');
-const adapterObj = createWorkBuddyAdapter(loopback);
+const adapterObj = createWorkBuddyAdapter(loopback, () => [], { scheduler, client, ledger });
 assert.strictEqual(adapterObj.providerName, 'workbuddy');
 assert.ok(adapterObj.aliases.includes('workbuddy2api'));
-const dshModels = await adapterObj.adapter.listModels();
+const pInfo = adapterObj.adapter.providerInfo('workbuddy2api');
+assert.strictEqual(pInfo.id, 'workbuddy2api');
+const dshModels = await adapterObj.adapter.listModels('workbuddy2api');
 assert.ok(dshModels.length > 0);
+assert.strictEqual(dshModels[0].provider, 'workbuddy2api');
+const resolvedInfo = await adapterObj.adapter.resolveModel('workbuddy2api', 'global:deepseek-v4.1-flash');
+assert.strictEqual(resolvedInfo.provider, 'workbuddy2api');
+assert.strictEqual(resolvedInfo.id, 'global:deepseek-v4.1-flash');
+const preparedCall = await adapterObj.adapter.prepareCall('workbuddy2api', 'global:deepseek-v4.1-flash');
+assert.strictEqual(typeof preparedCall.stream, 'function');
 console.log(`   ✓ DSH LLM 适配器就绪，模型清单包含 ${dshModels.length} 个条目`);
 
 // 8. 测试猫猫旅行状态机与 mock 驱动

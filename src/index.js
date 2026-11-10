@@ -17,6 +17,7 @@ import { fetchGrowthTasks, runAllGrowthTasks } from './upstream/tasks.js';
 import { PROVIDER_NAME, PROVIDER_ALIAS, SETTINGS_NS } from './constants.js';
 
 export const name = 'dsh-workbuddy2api';
+export const inject = ['webServer'];
 
 export function apply(ctx, rawConfig) {
   const config = unwrapConfig(rawConfig);
@@ -48,14 +49,27 @@ export function apply(ctx, rawConfig) {
   // 3. 注册 DSH 内部通信 WebServer 路由
   registerWebRoutes(ctx, { scheduler, client, ledger, loopback });
 
-  // 4. 注册 DSH LLM Provider 与 Adapter
-  const adapterObj = createWorkBuddyAdapter(loopback, () => Array.from(loopback.enabledModels));
-  const disposeLlm = registerLlmProvider(ctx, adapterObj);
+  // 4. 注册 DSH 原生 LLM Provider 与 Adapter
+  const adapterObj = createWorkBuddyAdapter(
+    loopback,
+    () => Array.from(loopback.enabledModels),
+    { scheduler, client, ledger, ctx }
+  );
+  let disposeLlm = null;
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['llm'], (llmCtx) => {
+      const d = registerLlmProvider(llmCtx, adapterObj);
+      llmCtx.effect?.(() => d, 'dsh-workbuddy2api llm lifecycle');
+    });
+  } else if (ctx.llm) {
+    disposeLlm = registerLlmProvider(ctx, adapterObj);
+  }
 
   // 5. 自动每日签到与猫猫旅行排程 (若启用)
+  let startupTimer = null;
   if (config.autoCheckin !== false) {
     scheduler.startAutoRoutines();
-    setTimeout(async () => {
+    startupTimer = setTimeout(async () => {
       const active = store.getActive();
       if (active) {
         try {
@@ -69,9 +83,10 @@ export function apply(ctx, rawConfig) {
     }, 3000);
   }
 
-  // 6. 生命周期卸载清理
+  // 6. 生命周期卸载清理（包含热重载时立即销毁占用端口与定时器）
   ctx.effect?.(() => {
     return () => {
+      if (startupTimer) clearTimeout(startupTimer);
       ctx.logger?.info?.('[dsh-workbuddy2api] 正在停止网关并释放资源...');
       scheduler.stopAutoRoutines();
       loopback.stop();

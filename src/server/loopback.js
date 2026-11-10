@@ -111,7 +111,9 @@ export class LoopbackGateway {
     });
 
     return new Promise((resolve) => {
-      this.server.listen(this.preferredPort, '0.0.0.0', () => {
+      let retried = false;
+
+      this.server.once('listening', () => {
         this.actualPort = this.server.address().port;
         console.log(`[loopback] 🚀 OpenAI 兼容网关已就绪: http://127.0.0.1:${this.actualPort}/v1`);
         resolve(this.actualPort);
@@ -119,14 +121,19 @@ export class LoopbackGateway {
 
       this.server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
+          if (!retried && this.preferredPort !== 0) {
+            retried = true;
+            setTimeout(() => {
+              this.server?.listen(this.preferredPort, '0.0.0.0');
+            }, 200);
+            return;
+          }
           console.warn(`[loopback] 端口 ${this.preferredPort} 被占用，自动随机分配可用端口...`);
-          this.server.listen(0, '0.0.0.0', () => {
-            this.actualPort = this.server.address().port;
-            console.log(`[loopback] 🚀 网关已绑定空闲端口: http://127.0.0.1:${this.actualPort}/v1`);
-            resolve(this.actualPort);
-          });
+          this.server?.listen(0, '0.0.0.0');
         }
       });
+
+      this.server.listen(this.preferredPort, '0.0.0.0');
     });
   }
 
@@ -268,7 +275,9 @@ export class LoopbackGateway {
 
   stop() {
     if (this.server) {
-      this.server.close();
+      try { this.server.closeAllConnections?.(); } catch (_) {}
+      try { this.server.closeIdleConnections?.(); } catch (_) {}
+      try { this.server.close(); } catch (_) {}
       this.server = null;
     }
   }
