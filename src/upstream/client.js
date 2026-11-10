@@ -2,6 +2,7 @@
  * client.js - WorkBuddy / CodeBuddy 统一高可用出站协议客户端
  */
 
+import crypto from 'node:crypto';
 import {
   CN_CHAT_BASE,
   CN_BILLING_BASE,
@@ -14,9 +15,20 @@ import {
   BILLING_METER_PATH_GLOBAL,
   ErrKind
 } from '../constants.js';
-import { normalizeReasoningEffort } from './efforts.js';
+import { prepareOutboundPayload } from './payload.js';
 import { prepareMessagesWithVision } from './vision.js';
 import { isVideoModel, executeVideoChatBridge } from './video.js';
+
+const CLIENT_VERSION = '5.5.4';
+const CLI_VERSION = '2.137.1';
+
+function deriveAccountStableID(uid, purpose) {
+  return crypto.createHash('sha256').update(`wb2a:${purpose}:${uid || ''}`).digest('hex').slice(0, 36);
+}
+
+function isValidHexTrace(s) {
+  return typeof s === 'string' && /^[0-9a-f]{16}$|^[0-9a-f]{32}$/i.test(s);
+}
 
 export class UpstreamClient {
   constructor(options = {}) {
@@ -38,43 +50,78 @@ export class UpstreamClient {
   }
 
   /**
-   * 构造上游全量统一请求头
+   * 构造上游全量统一请求头（全面对齐官方桌面端通道校验与追踪头族）
    */
-  buildHeaders(account, isChat = false) {
+  buildHeaders(account, isChat = false, meta = {}) {
+    const isGlobal = account.auth?.realm === 'global';
     const origin = this.getOrigin(account);
+    const platform = isGlobal ? 'WorkBuddy AI' : 'WorkBuddy';
+    const fullUA = `WorkBuddy/${CLIENT_VERSION} ${platform}/${CLIENT_VERSION} CLI/${CLI_VERSION}`;
+    const uid = account.account?.uid || '';
+
     const headers = {
-      'Accept': 'application/json, text/plain, */*',
+      'Accept': isChat ? 'application/json, text/event-stream' : 'application/json',
+      'Content-Type': 'application/json',
       'Origin': origin,
       'Referer': `${origin}/`,
       'X-Requested-With': 'XMLHttpRequest',
-      'User-Agent': this.customUA || 'WorkBuddy/1.2.34 WorkBuddy/1.2.34 CLI/1.2.34'
+      'User-Agent': this.customUA || (isChat ? fullUA : `WorkBuddy/${CLIENT_VERSION}`),
+      'X-CodeBuddy-Request': '1',
+      'Accept-Language': isGlobal ? 'en-US' : 'zh-CN'
     };
 
-    if (account.auth?.accessToken) {
-      headers['Authorization'] = `Bearer ${account.auth.accessToken}`;
-    }
-
-    if (account.account?.uid) {
-      headers['X-User-Id'] = account.account.uid;
+    if (uid) {
+      headers['X-Machine-ID'] = deriveAccountStableID(uid, 'machine');
+      headers['X-Session-ID'] = deriveAccountStableID(uid, 'session');
+      headers['X-User-Id'] = uid;
     } else {
       headers['X-No-User-Id'] = '1';
     }
 
-    if (account.account?.enterpriseId) {
-      headers['X-Enterprise-Id'] = account.account.enterpriseId;
-    } else {
-      headers['X-No-Enterprise-Id'] = '1';
+    if (account.auth?.accessToken) {
+      headers['Authorization'] = `Bearer ${account.auth.accessToken}`;
+    } else if (isChat) {
+      headers['X-No-Authorization'] = '1';
     }
 
-    if (account.auth?.domain) {
-      headers['X-Domain'] = account.auth.domain;
+    if (isGlobal) {
+      headers['X-No-Enterprise-Id'] = '1';
+      headers['X-Domain'] = 'www.workbuddy.ai';
     } else {
-      headers['X-No-Department-Info'] = '1';
+      if (account.account?.enterpriseId) {
+        headers['X-Enterprise-Id'] = account.account.enterpriseId;
+      } else {
+        headers['X-No-Enterprise-Id'] = '1';
+      }
+      if (account.auth?.domain) {
+        headers['X-Domain'] = account.auth.domain;
+      } else {
+        headers['X-No-Department-Info'] = '1';
+      }
     }
 
     if (isChat) {
-      headers['Content-Type'] = 'application/json';
-      headers['X-Product'] = 'SaaS';
+      headers['X-Agent-Purpose'] = 'conversation';
+      headers['X-IDE-Name'] = 'WorkBuddy';
+      headers['X-IDE-Type'] = 'WorkBuddy';
+      headers['X-IDE-Version'] = CLIENT_VERSION;
+      headers['X-Product'] = 'WorkBuddy';
+
+      const convId = meta.conversationId || crypto.randomUUID();
+      const convReqId = meta.conversationRequestId || crypto.randomBytes(16).toString('hex');
+      const msgId = crypto.randomBytes(16).toString('hex');
+      const traceId = meta.traceId || convReqId;
+      const b3Trace = isValidHexTrace(convReqId) ? convReqId : msgId;
+
+      headers['X-Conversation-ID'] = convId;
+      headers['X-Conversation-Request-ID'] = convReqId;
+      headers['X-Conversation-Message-ID'] = msgId;
+      headers['X-Request-ID'] = msgId;
+      headers['X-Root-Request-ID'] = convReqId;
+      headers['X-Trace-ID'] = traceId;
+      headers['X-B3-TraceId'] = b3Trace;
+      headers['X-B3-SpanId'] = msgId.slice(0, 16);
+      headers['X-B3-Sampled'] = '1';
     }
 
     return headers;
@@ -94,6 +141,9 @@ export class UpstreamClient {
     if (status === 429 || text.includes('6004') || text.includes('rate limit') || text.includes('frequency')) {
       return ErrKind.SOFT_RATE;
     }
+    if (text.includes('11128') || text.includes('content') || text.includes('sensitive') || text.includes('violation')) {
+      return ErrKind.CONTENT_BLOCKED;
+    }
     if (status === 403) {
       return ErrKind.WAF_BLOCK;
     }
@@ -105,9 +155,6 @@ export class UpstreamClient {
     }
     if (text.includes('11101') || text.includes('unmarshal') || text.includes('bad param')) {
       return ErrKind.BAD_PARAMS;
-    }
-    if (text.includes('content') || text.includes('sensitive') || text.includes('violation')) {
-      return ErrKind.CONTENT_BLOCKED;
     }
     if (status >= 500) {
       return ErrKind.SERVER;
@@ -335,8 +382,9 @@ export class UpstreamClient {
   /**
    * 发起流式 Chat Completions 调用
    */
-  async chatStream(account, reqBody, signal) {
+  async chatStream(account, reqBody, signal, meta = {}) {
     const realm = account.auth?.realm || 'cn';
+    const uid = account.account?.uid || '';
     const bareModel = (reqBody.model || '').replace(/^(cn:|global:|solo:|trae:)/i, '');
 
     // 检查是否为专属视频大模型直出请求
@@ -350,24 +398,30 @@ export class UpstreamClient {
     // 视觉与多模态预处理
     const preparedMessages = await prepareMessagesWithVision(reqBody.messages);
 
-    // 严格处理推理思考档位
-    const rawEffort = reqBody.reasoning_effort;
-    const normalizedEffort = normalizeReasoningEffort(realm, bareModel, rawEffort);
+    // 解析或生成统一会话标识符（防 11128 conversation id missing）
+    const conversationId =
+      reqBody.conversation_id ||
+      reqBody.conversationId ||
+      meta.conversationId ||
+      crypto.randomUUID();
+    const convReqId = meta.conversationRequestId || crypto.randomBytes(16).toString('hex');
 
-    // 组装发往官方协议请求体
-    const upstreamBody = {
-      model: bareModel,
-      messages: preparedMessages,
-      stream: true,
-      ...(reqBody.temperature !== undefined ? { temperature: reqBody.temperature } : {}),
-      ...(reqBody.top_p !== undefined ? { top_p: reqBody.top_p } : {}),
-      ...(reqBody.max_tokens ? { max_tokens: reqBody.max_tokens } : {}),
-      ...(normalizedEffort ? { reasoning_effort: normalizedEffort } : {})
-    };
+    // 组装完整兼容官方渠道校验、风控脱敏、工具与思考协议的请求体
+    const upstreamBody = prepareOutboundPayload(reqBody, preparedMessages, {
+      realm,
+      uid,
+      bareModel,
+      conversationId
+    });
 
     const base = this.getChatBase(account);
     const url = `${base}${CHAT_COMPLETIONS_PATH}`;
-    const headers = this.buildHeaders(account, true);
+    const chatMeta = {
+      conversationId,
+      conversationRequestId: convReqId,
+      traceId: meta.traceId || convReqId
+    };
+    const headers = this.buildHeaders(account, true, chatMeta);
 
     let res = await fetch(url, {
       method: 'POST',
@@ -380,7 +434,7 @@ export class UpstreamClient {
     if (res.status === 401 && account.auth?.refreshToken) {
       try {
         await this.refreshToken(account);
-        const retryHeaders = this.buildHeaders(account, true);
+        const retryHeaders = this.buildHeaders(account, true, chatMeta);
         res = await fetch(url, {
           method: 'POST',
           headers: retryHeaders,

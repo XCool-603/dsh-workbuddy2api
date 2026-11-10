@@ -72,6 +72,15 @@ export class Scheduler {
     const uid = account.account?.uid;
     if (!uid) return;
 
+    // 请求侧内容违规或参数问题，属于客户端请求本身特征，不属于账号故障，不施加账号熔断
+    if (
+      kind === ErrKind.CONTENT_BLOCKED ||
+      kind === ErrKind.BAD_PARAMS ||
+      kind === ErrKind.PROMPT_TOO_LONG
+    ) {
+      return;
+    }
+
     let cb = this.circuitBreakers.get(uid) || { failures: 0, cooldownUntil: 0, reason: '' };
     cb.failures += 1;
     cb.reason = message;
@@ -182,11 +191,24 @@ export class Scheduler {
           this.recordFailure(account, result.kind, result.message);
           this.release(account);
           lastError = new Error(result.message);
-          // 若为可重试错误（429、余额、失效），继续轮换到下一个账号
+          lastError.status = result.status;
+          lastError.kind = result.kind;
+          lastError.nonRetryable = (
+            result.kind === ErrKind.CONTENT_BLOCKED ||
+            result.kind === ErrKind.BAD_PARAMS ||
+            result.kind === ErrKind.PROMPT_TOO_LONG
+          );
+
+          if (lastError.nonRetryable) {
+            throw lastError;
+          }
+
+          // 若为可重试错误（429、余额、失效、服务端、WAF），继续轮换到下一个账号
           if (
             result.kind === ErrKind.SOFT_RATE ||
             result.kind === ErrKind.HARD_CREDIT ||
             result.kind === ErrKind.SESSION_DEAD ||
+            result.kind === ErrKind.WAF_BLOCK ||
             result.kind === ErrKind.SERVER
           ) {
             console.log(`[scheduler] 账号 ${account.account.uid} 遇 ${result.kind}，自动切换至下一个账号...`);
@@ -203,6 +225,9 @@ export class Scheduler {
           release: () => this.release(account)
         };
       } catch (err) {
+        if (err.nonRetryable) {
+          throw err;
+        }
         this.recordFailure(account, ErrKind.CLIENT, err.message);
         this.release(account);
         lastError = err;

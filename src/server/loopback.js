@@ -149,9 +149,15 @@ export class LoopbackGateway {
       const isStream = Boolean(body.stream);
       const reqId = `chatcmpl-${Date.now()}`;
 
+      const meta = {
+        conversationId: req.headers['x-conversation-id'] || req.headers['x-session-id'] || body.conversation_id || body.conversationId,
+        conversationRequestId: req.headers['x-conversation-request-id'],
+        traceId: req.headers['x-trace-id']
+      };
+
       try {
         const execution = await this.scheduler.executeWithFailover(actualModel, async (account) => {
-          return await this.client.chatStream(account, body);
+          return await this.client.chatStream(account, body, undefined, meta);
         });
 
         // 视频大模型直出逻辑
@@ -252,7 +258,8 @@ export class LoopbackGateway {
         }
       } catch (err) {
         if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
+          const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: err.message, type: 'api_error' } }));
         }
       }

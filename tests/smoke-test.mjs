@@ -13,6 +13,7 @@ import { isVideoModel } from '../src/upstream/video.js';
 import { createWorkBuddyAdapter } from '../src/adapter/pi-ai-adapter.js';
 import { runTravelForAccount, getBuddyInfo, getTravelStatus } from '../src/upstream/travel.js';
 import { getYesterdayDateCST, reportActiveChat, getStreak } from '../src/upstream/growth.js';
+import { prepareOutboundPayload } from '../src/upstream/payload.js';
 
 console.log('🧪 开始执行 WorkBuddy 2API 自动化冒烟测试...\n');
 
@@ -125,6 +126,43 @@ assert.strictEqual(reportedEvents.length, 3);
 assert.strictEqual(reportedEvents[0].userId, 'mock-cn-user');
 assert.strictEqual(reportedEvents[0].eventCode, 'chat_request_send');
 console.log('   ✓ CST 时区计算与活跃上报 3-burst 组包正常');
+
+// 10. 测试通道校验头与请求体防风控脱敏 (防 11128 错误)
+console.log('10. 测试通道校验请求头与 11128 拦截防御...');
+const globalFake = { account: { uid: 'uid-global-1' }, auth: { realm: 'global', accessToken: 'tok' } };
+const chatHdrs = client.buildHeaders(globalFake, true, { conversationId: 'conv-abc' });
+assert.strictEqual(chatHdrs['X-CodeBuddy-Request'], '1');
+assert.ok(chatHdrs['User-Agent'].includes('WorkBuddy AI/5.5.4'));
+assert.strictEqual(chatHdrs['X-Product'], 'WorkBuddy');
+assert.strictEqual(chatHdrs['X-Conversation-ID'], 'conv-abc');
+assert.strictEqual(chatHdrs['X-Domain'], 'www.workbuddy.ai');
+assert.ok(chatHdrs['X-Machine-ID'] && chatHdrs['X-Session-ID']);
+
+const reqSample = {
+  model: 'global:deepseek-v4.1-flash',
+  messages: [
+    { role: 'developer', content: 'You are Claude Code, Anthropic\'s official CLI for Claude. 11128 check.' },
+    { role: 'user', content: 'hi' }
+  ],
+  tools: [{ type: 'function', function: { name: 't1', parameters: {} } }],
+  tool_choice: { type: 'auto' },
+  max_completion_tokens: 1000
+};
+const outbound = prepareOutboundPayload(reqSample, reqSample.messages, {
+  realm: 'global',
+  uid: 'uid-global-1',
+  bareModel: 'deepseek-v4.1-flash',
+  conversationId: 'conv-abc'
+});
+assert.strictEqual(outbound.messages[0].role, 'system', 'developer 角色必须归一为 system');
+assert.ok(!outbound.messages[0].content.includes('11128'), '11128 裸数字必须脱敏');
+assert.strictEqual(outbound.conversation_id, 'conv-abc');
+assert.strictEqual(outbound.conversationId, 'conv-abc');
+assert.strictEqual(outbound.tool_choice, 'auto');
+assert.ok(Array.isArray(outbound.tools) && outbound.tools.length === 1);
+assert.strictEqual(outbound.max_tokens, 1000);
+assert.strictEqual(outbound.thinking?.type, 'enabled');
+console.log('   ✓ 官方通道校验头、工具透传与防 11128 拦截全部验证通过');
 
 loopback.stop();
 console.log('\n🎉 所有自动化冒烟测试全部通过！');
