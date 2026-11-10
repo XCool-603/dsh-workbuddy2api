@@ -1,0 +1,130 @@
+/**
+ * smoke-test.mjs - WorkBuddy 2API 全功能自动化验证套件
+ */
+
+import assert from 'node:assert';
+import { AccountStore } from '../src/pool/account-store.js';
+import { Scheduler } from '../src/pool/scheduler.js';
+import { UpstreamClient } from '../src/upstream/client.js';
+import { UsageLedger } from '../src/pool/ledger.js';
+import { LoopbackGateway } from '../src/server/loopback.js';
+import { normalizeReasoningEffort } from '../src/upstream/efforts.js';
+import { isVideoModel } from '../src/upstream/video.js';
+import { createWorkBuddyAdapter } from '../src/adapter/pi-ai-adapter.js';
+import { runTravelForAccount, getBuddyInfo, getTravelStatus } from '../src/upstream/travel.js';
+import { getYesterdayDateCST, reportActiveChat, getStreak } from '../src/upstream/growth.js';
+
+console.log('🧪 开始执行 WorkBuddy 2API 自动化冒烟测试...\n');
+
+// 1. 测试账号存储与多账号自动发现
+console.log('1. 测试 AccountStore 账号管理与自动同步...');
+const store = new AccountStore();
+const accounts = store.getAll();
+assert.ok(accounts.length > 0, '账号池应成功加载或发现账号');
+const active = store.getActive();
+assert.ok(active && active.account?.uid, '必须存在激活的主账号');
+console.log(`   ✓ 账号池加载成功，发现 ${accounts.length} 个账号，当前主号: ${active.account.uid}`);
+
+// 2. 测试调度器与并发槽位租约
+console.log('2. 测试 Scheduler 并发租约与熔断状态机...');
+const scheduler = new Scheduler(store, { maxInFlightCN: 2, maxInFlightGlobal: 2 });
+assert.strictEqual(scheduler.getInFlight(active.account.uid), 0);
+assert.ok(scheduler.acquire(active), '第一次申请槽位租约应成功');
+assert.strictEqual(scheduler.getInFlight(active.account.uid), 1);
+scheduler.release(active);
+assert.strictEqual(scheduler.getInFlight(active.account.uid), 0, '释放槽位后计数归零');
+console.log('   ✓ 并发槽位租约控制正常');
+
+// 3. 测试推理档位归一化（避免 11150 错误）
+console.log('3. 测试推理思考档位（Reasoning Effort）归一化...');
+assert.strictEqual(normalizeReasoningEffort('cn', 'deepseek-v4.1-flash', 'off'), null, 'off 档位必须丢弃为 null');
+assert.strictEqual(normalizeReasoningEffort('cn', 'deepseek-v4.1-flash', 'high'), 'high');
+assert.strictEqual(normalizeReasoningEffort('global', 'deepseek-v4.1-flash', 'low'), 'high', '国际版 v4.1 只认 high，low 必须修正为 high');
+console.log('   ✓ 推理档位严格防御与纠偏正常');
+
+// 4. 测试专属视频大模型判定
+console.log('4. 测试视频大模型（可灵 3.0 / 海螺 H3）识别...');
+assert.ok(isVideoModel('kling-video-v3'));
+assert.ok(isVideoModel('kling-v3-pro'));
+assert.ok(isVideoModel('minimax-video-h3'));
+assert.ok(!isVideoModel('deepseek-v4.1-flash'));
+console.log('   ✓ 视频模型识别正常');
+
+// 5. 测试用量账本
+console.log('5. 测试 UsageLedger 用量统计与 7 天走势...');
+const ledger = new UsageLedger();
+ledger.record('global:deepseek-v4.1-flash', 100, 200, true);
+const stats = ledger.getStats();
+assert.ok(stats.today.requests >= 1);
+assert.ok(Array.isArray(stats.trend7d) && stats.trend7d.length === 7);
+console.log('   ✓ 用量统计与近 7 天走势生成正常');
+
+// 6. 测试本地 Loopback 网关服务
+console.log('6. 测试 Loopback 网关服务启动与模型列表...');
+const client = new UpstreamClient();
+const loopback = new LoopbackGateway(scheduler, client, ledger, { port: 0 });
+const port = await loopback.start();
+assert.ok(port > 0, '网关必须成功绑定端口');
+
+const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
+assert.strictEqual(healthRes.status, 200);
+const healthJson = await healthRes.json();
+assert.strictEqual(healthJson.status, 'ok');
+
+const modelsRes = await fetch(`http://127.0.0.1:${port}/v1/models`);
+assert.strictEqual(modelsRes.status, 200);
+const modelsJson = await modelsRes.json();
+assert.ok(Array.isArray(modelsJson.data) && modelsJson.data.length > 0);
+console.log(`   ✓ Loopback 网关成功启动在端口 ${port}，/v1/models 响应正常 (共 ${modelsJson.data.length} 个模型)`);
+
+// 7. 测试 DSH LLM Adapter 生成
+console.log('7. 测试 DSH LLM Seam 适配器构建...');
+const adapterObj = createWorkBuddyAdapter(loopback);
+assert.strictEqual(adapterObj.providerName, 'workbuddy');
+assert.ok(adapterObj.aliases.includes('workbuddy2api'));
+const dshModels = await adapterObj.adapter.listModels();
+assert.ok(dshModels.length > 0);
+console.log(`   ✓ DSH LLM 适配器就绪，模型清单包含 ${dshModels.length} 个条目`);
+
+// 8. 测试猫猫旅行状态机与 mock 驱动
+console.log('8. 测试猫猫旅行 (Cat Travel) 状态机...');
+const mockFetchTravel = async (url, opts) => {
+  if (url.includes('/buddy/info')) {
+    return { ok: true, json: async () => ({ code: 0, data: { buddy: { id: 1001, name: '招财猫' } } }) };
+  }
+  if (url.includes('/travel/status')) {
+    return { ok: true, json: async () => ({ code: 0, data: { state: 'idle', daily_limit_reached: false, record_id: 0, reward_credit: 0 } }) };
+  }
+  if (url.includes('/travel/depart')) {
+    return { ok: true, json: async () => ({ code: 0, data: {} }) };
+  }
+  return { ok: true, json: async () => ({ code: 0 }) };
+};
+const fakeAccount = {
+  account: { uid: 'mock-cn-user' },
+  auth: { realm: 'cn', accessToken: 'mock-token' }
+};
+const travelRun = await runTravelForAccount(fakeAccount, mockFetchTravel);
+assert.strictEqual(travelRun.status, 'ok');
+assert.strictEqual(travelRun.results.buddy.name, '招财猫');
+assert.strictEqual(travelRun.results.actions[0].action, 'depart');
+console.log('   ✓ 猫猫旅行状态机流转与自动派出测试通过');
+
+// 9. 测试 CST 自然日与成长福利
+console.log('9. 测试 CST 日期计算与活跃上报事件结构...');
+const yest = getYesterdayDateCST(new Date('2026-11-10T02:00:00Z')); // UTC 02:00 = CST 10:00
+assert.strictEqual(yest, '2026-11-09', 'CST 昨日计算必须正确');
+let reportedEvents = [];
+const mockFetchGrowth = async (url, opts) => {
+  reportedEvents = JSON.parse(opts.body);
+  return { ok: true, json: async () => ({ code: 0, msg: 'ok' }) };
+};
+const repRes = await reportActiveChat(fakeAccount, 3, mockFetchGrowth);
+assert.ok(repRes.ok);
+assert.strictEqual(reportedEvents.length, 3);
+assert.strictEqual(reportedEvents[0].userId, 'mock-cn-user');
+assert.strictEqual(reportedEvents[0].eventCode, 'chat_request_send');
+console.log('   ✓ CST 时区计算与活跃上报 3-burst 组包正常');
+
+loopback.stop();
+console.log('\n🎉 所有自动化冒烟测试全部通过！');

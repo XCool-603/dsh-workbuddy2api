@@ -1,0 +1,411 @@
+/**
+ * client.js - WorkBuddy / CodeBuddy 统一高可用出站协议客户端
+ */
+
+import {
+  CN_CHAT_BASE,
+  CN_BILLING_BASE,
+  GLOBAL_BASE,
+  CHAT_COMPLETIONS_PATH,
+  TOKEN_REFRESH_PATH,
+  CN_MODELS_PATH,
+  V3_CONFIG_PATH,
+  BILLING_METER_PATH_CN,
+  BILLING_METER_PATH_GLOBAL,
+  ErrKind
+} from '../constants.js';
+import { normalizeReasoningEffort } from './efforts.js';
+import { prepareMessagesWithVision } from './vision.js';
+import { isVideoModel, executeVideoChatBridge } from './video.js';
+
+export class UpstreamClient {
+  constructor(options = {}) {
+    this.proxy = options.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
+    this.customUA = options.userAgent || '';
+    this.onTokenRefresh = options.onTokenRefresh || null;
+  }
+
+  getChatBase(account) {
+    return account.auth?.realm === 'global' ? GLOBAL_BASE : CN_CHAT_BASE;
+  }
+
+  getBillingBase(account) {
+    return account.auth?.realm === 'global' ? GLOBAL_BASE : CN_BILLING_BASE;
+  }
+
+  getOrigin(account) {
+    return account.auth?.realm === 'global' ? GLOBAL_BASE : CN_BILLING_BASE;
+  }
+
+  /**
+   * 构造上游全量统一请求头
+   */
+  buildHeaders(account, isChat = false) {
+    const origin = this.getOrigin(account);
+    const headers = {
+      'Accept': 'application/json, text/plain, */*',
+      'Origin': origin,
+      'Referer': `${origin}/`,
+      'X-Requested-With': 'XMLHttpRequest',
+      'User-Agent': this.customUA || 'WorkBuddy/1.2.34 WorkBuddy/1.2.34 CLI/1.2.34'
+    };
+
+    if (account.auth?.accessToken) {
+      headers['Authorization'] = `Bearer ${account.auth.accessToken}`;
+    }
+
+    if (account.account?.uid) {
+      headers['X-User-Id'] = account.account.uid;
+    } else {
+      headers['X-No-User-Id'] = '1';
+    }
+
+    if (account.account?.enterpriseId) {
+      headers['X-Enterprise-Id'] = account.account.enterpriseId;
+    } else {
+      headers['X-No-Enterprise-Id'] = '1';
+    }
+
+    if (account.auth?.domain) {
+      headers['X-Domain'] = account.auth.domain;
+    } else {
+      headers['X-No-Department-Info'] = '1';
+    }
+
+    if (isChat) {
+      headers['Content-Type'] = 'application/json';
+      headers['X-Product'] = 'SaaS';
+    }
+
+    return headers;
+  }
+
+  /**
+   * 错误归类逻辑
+   */
+  classifyError(status, bodyText) {
+    const text = (bodyText || '').toLowerCase();
+    if (status === 401 || text.includes('12153') || text.includes('token expired') || text.includes('session dead')) {
+      return ErrKind.SESSION_DEAD;
+    }
+    if (status === 402 || text.includes('credit') || text.includes('balance') || text.includes('余额不足') || text.includes('积分不足')) {
+      return ErrKind.HARD_CREDIT;
+    }
+    if (status === 429 || text.includes('6004') || text.includes('rate limit') || text.includes('frequency')) {
+      return ErrKind.SOFT_RATE;
+    }
+    if (status === 403) {
+      return ErrKind.WAF_BLOCK;
+    }
+    if (text.includes('11140') || text.includes('account blocked') || text.includes('trial not activated')) {
+      return ErrKind.ACCOUNT_FAULT;
+    }
+    if (text.includes('11115') || text.includes('prompt is too long')) {
+      return ErrKind.PROMPT_TOO_LONG;
+    }
+    if (text.includes('11101') || text.includes('unmarshal') || text.includes('bad param')) {
+      return ErrKind.BAD_PARAMS;
+    }
+    if (text.includes('content') || text.includes('sensitive') || text.includes('violation')) {
+      return ErrKind.CONTENT_BLOCKED;
+    }
+    if (status >= 500) {
+      return ErrKind.SERVER;
+    }
+    return ErrKind.CLIENT;
+  }
+
+  /**
+   * 刷新账号 Token
+   */
+  async refreshToken(account) {
+    if (!account.auth?.refreshToken) {
+      throw new Error('No refresh token available');
+    }
+
+    const base = this.getChatBase(account);
+    const url = `${base}${TOKEN_REFRESH_PATH}`;
+    const headers = this.buildHeaders(account, false);
+    headers['X-Refresh-Token'] = account.auth.refreshToken;
+    headers['X-Auth-Refresh-Source'] = 'workbuddy';
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      signal: AbortSignal.timeout(15000)
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || (data.code !== 0 && data.code !== 200)) {
+      throw new Error(data.msg || `Token 刷新失败 (HTTP ${res.status})`);
+    }
+
+    const payload = data.data || {};
+    const newAccess = payload.accessToken || payload.access_token;
+    const newRefresh = payload.refreshToken || payload.refresh_token || account.auth.refreshToken;
+    const expiresIn = payload.expiresIn || 7200;
+
+    if (!newAccess) {
+      throw new Error('未返回有效 accessToken');
+    }
+
+    account.auth.accessToken = newAccess;
+    account.auth.refreshToken = newRefresh;
+    account.auth.expiresAt = Date.now() + expiresIn * 1000;
+    account.updatedAt = Date.now();
+
+    if (typeof this.onTokenRefresh === 'function') {
+      try {
+        this.onTokenRefresh(account);
+      } catch (_) {}
+    }
+
+    return account;
+  }
+
+  /**
+   * 拉取账号余额与套餐信息
+   */
+  async fetchBalance(account) {
+    const isGlobal = account.auth?.realm === 'global';
+    const base = this.getBillingBase(account);
+    const primaryPath = isGlobal ? BILLING_METER_PATH_GLOBAL : BILLING_METER_PATH_CN;
+    const fallbackPath = isGlobal ? BILLING_METER_PATH_CN : BILLING_METER_PATH_GLOBAL;
+
+    const doRequest = async (path) => {
+      const url = `${base}${path}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: this.buildHeaders(account, false),
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(10000)
+      });
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    };
+
+    let { res, data } = await doRequest(primaryPath);
+
+    // 1. 若返回 401 或 token 失效代码 (如 12153, 10002, 401)，且有 refreshToken 则自动续期后重试
+    const isAuthErr = res.status === 401 || data.code === 401 || data.code === 12153 || data.code === 10002 ||
+      (typeof data.msg === 'string' && /token|auth|expire|unauthorized/i.test(data.msg));
+
+    if (isAuthErr && account.auth?.refreshToken) {
+      try {
+        await this.refreshToken(account);
+        const retry = await doRequest(primaryPath);
+        res = retry.res;
+        data = retry.data;
+      } catch (err) {
+        throw new Error(`Token 已失效且刷新失败: ${err.message}`);
+      }
+    }
+
+    // 2. 若返回 404，尝试备用路径
+    if (res.status === 404) {
+      const fallback = await doRequest(fallbackPath);
+      if (fallback.res.ok) {
+        res = fallback.res;
+        data = fallback.data;
+      }
+    }
+
+    if (!res.ok || (data.code !== 0 && data.code !== 200)) {
+      throw new Error(data.msg || `查询余额失败 (${res.status})`);
+    }
+
+    const raw = data.data || {};
+    let remain = 0;
+    let packages = [];
+
+    // 1. 优先解析官方腾讯云底层计量账单结构 (Response.Data.Accounts)
+    const accounts = raw.Response?.Data?.Accounts || data.Response?.Data?.Accounts || [];
+    if (Array.isArray(accounts) && accounts.length > 0) {
+      for (const a of accounts) {
+        let pRemain = 0;
+        let pSize = 0;
+        let pUsed = 0;
+        if (a.CycleCapacitySize > 0) {
+          pRemain = Math.max(0, Math.min(a.CycleCapacitySize, a.CycleCapacityRemain ?? 0));
+          pSize = a.CycleCapacitySize;
+          pUsed = a.CycleCapacityUsed ?? Math.max(0, pSize - pRemain);
+        } else {
+          pRemain = Math.max(0, a.CapacityRemain ?? 0);
+          pSize = a.CapacitySize ?? pRemain;
+          pUsed = a.CapacityUsed ?? Math.max(0, pSize - pRemain);
+        }
+
+        remain += pRemain;
+        if (pRemain > 0 || (a.Status !== 3 && pSize > 0)) {
+          packages.push({
+            name: a.PackageName || '积分包',
+            remain: pRemain,
+            used: pUsed,
+            size: pSize,
+            expireTime: a.CycleEndTime || a.ExpiredTime || ''
+          });
+        }
+      }
+    } else if (Array.isArray(raw.userPackageList)) {
+      for (const p of raw.userPackageList) {
+        remain += p.remain || 0;
+        packages.push({
+          name: p.packageName || p.name || '积分包',
+          remain: p.remain || 0,
+          used: p.used || 0,
+          expireTime: p.expireTime || p.expiresAt || ''
+        });
+      }
+    } else {
+      remain = raw.totalRemain ?? raw.remain ?? raw.points ?? 0;
+    }
+
+    return {
+      remain,
+      packages,
+      fetchedAt: Date.now()
+    };
+  }
+
+  /**
+   * 向上游发现真实可用模型
+   */
+  async fetchModels(account) {
+    const base = this.getChatBase(account);
+    const models = [];
+    const seen = new Set();
+
+    // 1. 尝试探测 V3 Config 端点
+    try {
+      const v3Res = await fetch(`${base}${V3_CONFIG_PATH}`, {
+        headers: this.buildHeaders(account, false),
+        signal: AbortSignal.timeout(8000)
+      });
+      if (v3Res.ok) {
+        const v3Data = await v3Res.json().catch(() => ({}));
+        const list = v3Data.data?.models || v3Data.models || [];
+        for (const item of list) {
+          const id = item.id || item.name;
+          if (id && !item.disabled && !seen.has(id)) {
+            seen.add(id);
+            models.push({
+              id,
+              name: item.displayName || item.name || id,
+              contextWindow: item.contextWindow || 200000,
+              maxTokens: item.maxTokens || 32000,
+              supportsImages: Boolean(item.supportsImages || item.multimodal),
+              rate: item.rate || '标准'
+            });
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 2. 尝试探测 CN 插件 Auth 端点
+    if (models.length === 0) {
+      try {
+        const cnRes = await fetch(`${base}${CN_MODELS_PATH}`, {
+          headers: this.buildHeaders(account, false),
+          signal: AbortSignal.timeout(8000)
+        });
+        if (cnRes.ok) {
+          const cnData = await cnRes.json().catch(() => ({}));
+          const list = cnData.data || [];
+          for (const item of list) {
+            const id = item.id || item.model;
+            if (id && !seen.has(id)) {
+              seen.add(id);
+              models.push({
+                id,
+                name: item.name || id,
+                contextWindow: item.context_length || 200000,
+                maxTokens: 32000,
+                supportsImages: true,
+                rate: item.rate || '标准'
+              });
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    return models;
+  }
+
+  /**
+   * 发起流式 Chat Completions 调用
+   */
+  async chatStream(account, reqBody, signal) {
+    const realm = account.auth?.realm || 'cn';
+    const bareModel = (reqBody.model || '').replace(/^(cn:|global:|solo:|trae:)/i, '');
+
+    // 检查是否为专属视频大模型直出请求
+    if (isVideoModel(bareModel)) {
+      return {
+        isVideo: true,
+        executeVideo: (onChunk) => executeVideoChatBridge(account, bareModel, reqBody.messages, onChunk)
+      };
+    }
+
+    // 视觉与多模态预处理
+    const preparedMessages = await prepareMessagesWithVision(reqBody.messages);
+
+    // 严格处理推理思考档位
+    const rawEffort = reqBody.reasoning_effort;
+    const normalizedEffort = normalizeReasoningEffort(realm, bareModel, rawEffort);
+
+    // 组装发往官方协议请求体
+    const upstreamBody = {
+      model: bareModel,
+      messages: preparedMessages,
+      stream: true,
+      ...(reqBody.temperature !== undefined ? { temperature: reqBody.temperature } : {}),
+      ...(reqBody.top_p !== undefined ? { top_p: reqBody.top_p } : {}),
+      ...(reqBody.max_tokens ? { max_tokens: reqBody.max_tokens } : {}),
+      ...(normalizedEffort ? { reasoning_effort: normalizedEffort } : {})
+    };
+
+    const base = this.getChatBase(account);
+    const url = `${base}${CHAT_COMPLETIONS_PATH}`;
+    const headers = this.buildHeaders(account, true);
+
+    let res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(upstreamBody),
+      signal
+    });
+
+    // 若返回 401，尝试刷新 Token 后重试一次
+    if (res.status === 401 && account.auth?.refreshToken) {
+      try {
+        await this.refreshToken(account);
+        const retryHeaders = this.buildHeaders(account, true);
+        res = await fetch(url, {
+          method: 'POST',
+          headers: retryHeaders,
+          body: JSON.stringify(upstreamBody),
+          signal
+        });
+      } catch (_) {}
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      const kind = this.classifyError(res.status, errText);
+      return {
+        ok: false,
+        status: res.status,
+        kind,
+        message: errText || `上游返回 HTTP ${res.status}`
+      };
+    }
+
+    return {
+      ok: true,
+      status: res.status,
+      response: res,
+      bodyStream: res.body
+    };
+  }
+}

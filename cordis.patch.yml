@@ -1,0 +1,5 @@
+# DeepSeek Harness (DSH) workbuddy2api bundle patch
+# 自动向 DSH 注册 WorkBuddy 2API 网关与模型服务提供方
+- insert:
+    - id: llm-workbuddy2api
+      name: dsh-workbuddy2api

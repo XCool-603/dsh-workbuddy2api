@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+auths/
+data/
+*.local
+.workbuddy2api-accounts.json
+.workbuddy2api-usage.json

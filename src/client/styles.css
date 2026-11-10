@@ -1,0 +1,180 @@
+/**
+ * styles.css - DSH WorkBuddy2API 现代化极客卡片样式
+ */
+
+.wb2a-card {
+  font-family: var(--dsh-font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+  color: var(--dsh-color-fg, #e2e8f0);
+  background: var(--dsh-color-bg-card, #131722);
+  border: 1px solid var(--dsh-color-border, #2a324b);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.wb2a-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--dsh-color-border, #2a324b);
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+}
+
+.wb2a-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #38bdf8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wb2a-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.wb2a-badge-success {
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.wb2a-badge-warn {
+  background: rgba(234, 179, 8, 0.15);
+  color: #facc15;
+  border: 1px solid rgba(234, 179, 8, 0.3);
+}
+
+.wb2a-tabs {
+  display: flex;
+  gap: 8px;
+  border-bottom: 1px solid var(--dsh-color-border, #2a324b);
+  margin-bottom: 16px;
+}
+
+.wb2a-tab-btn {
+  background: transparent;
+  border: none;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: var(--dsh-color-fg-muted, #94a3b8);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+
+.wb2a-tab-btn:hover {
+  color: #38bdf8;
+}
+
+.wb2a-tab-btn.active {
+  color: #38bdf8;
+  border-bottom-color: #38bdf8;
+  font-weight: 600;
+}
+
+.wb2a-account-item {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--dsh-color-border, #2a324b);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.wb2a-account-item.active {
+  border-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.04);
+}
+
+.wb2a-btn {
+  background: #0284c7;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.wb2a-btn:hover {
+  background: #0369a1;
+}
+
+.wb2a-btn-secondary {
+  background: rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+}
+
+.wb2a-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.wb2a-btn-danger {
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.wb2a-btn-danger:hover {
+  background: rgba(239, 68, 68, 0.3);
+}
+
+.wb2a-input {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--dsh-color-border, #2a324b);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #f1f5f9;
+  font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.wb2a-grid-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.wb2a-stat-box {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--dsh-color-border, #2a324b);
+  border-radius: 8px;
+  padding: 10px;
+  text-align: center;
+}
+
+.wb2a-stat-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #38bdf8;
+}
+
+.wb2a-stat-label {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 4px;
+}
+
+.wb2a-dock-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #94a3b8;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}

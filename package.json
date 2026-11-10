@@ -1,0 +1,83 @@
+{
+  "name": "dsh-workbuddy2api",
+  "version": "1.0.0",
+  "displayName": "DSH WorkBuddy2API Connect & Gateway",
+  "description": "将 WorkBuddy / CodeBuddy 多账号高可用调度网关无缝接入 DeepSeek Harness (DSH) — 具备多账号池轮转、双域调度、全模型兼容、智能免密路由、全模态视觉、自动签到福利与本地 OpenAI 兼容网关",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "bin": {
+    "dsh-workbuddy2api": "bin/dsh-workbuddy2api.js",
+    "dsh-workbody2api": "bin/dsh-workbuddy2api.js"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ],
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "test": "node tests/smoke-test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "workbuddy",
+    "workbody",
+    "codebuddy",
+    "model-provider",
+    "workbuddy2api"
+  ],
+  "author": "XCool-603",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XCool-603/dsh-workbuddy2api.git"
+  },
+  "homepage": "https://github.com/XCool-603/dsh-workbuddy2api#readme",
+  "peerDependencies": {
+    "react": "^18.2.0 || ^18.3.1",
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@deepseek-ai/dsh-settings": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-home-paths": ">=0.1.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.2-rc.1 <0.3.0-0"
+  }
+}
