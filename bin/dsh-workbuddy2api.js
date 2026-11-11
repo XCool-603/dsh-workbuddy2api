@@ -3,10 +3,15 @@
  * dsh-workbuddy2api CLI - 终端诊断、账号管理与用量排查工具
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { AccountStore } from '../src/pool/account-store.js';
 import { UpstreamClient } from '../src/upstream/client.js';
 import { UsageLedger } from '../src/pool/ledger.js';
 import { performCheckin } from '../src/upstream/checkin.js';
+import { claimGlobalTrial } from '../src/upstream/trial.js';
+import { fetchInviteInfo, bindInviteCode } from '../src/upstream/invite.js';
+import { batchImportAccounts, exportBackupZip } from '../src/pool/import-export.js';
 import {
   getBuddyInfo,
   getTravelStatus,
@@ -307,6 +312,88 @@ async function main() {
       break;
     }
 
+    case 'trial': {
+      const globals = store.getAll().filter((a) => a.auth?.realm === 'global');
+      if (globals.length === 0) {
+        console.log('⚠️ 账号池内暂无国际版 (global) 账号');
+        break;
+      }
+      const results = [];
+      for (const acc of globals) {
+        const res = await claimGlobalTrial(acc, client);
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...res });
+        console.log(`• ${acc.account.nickname} (${acc.account.uid}): ${res.message}`);
+      }
+      if (isJson) console.log(JSON.stringify(results, null, 2));
+      break;
+    }
+
+    case 'invite': {
+      const active = store.getActive();
+      if (!active) {
+        console.error('❌ 账号池无可用账号');
+        process.exit(1);
+      }
+      if (args[0] === 'bind' && args[1]) {
+        const res = await bindInviteCode(active, args[1]);
+        console.log(isJson ? JSON.stringify(res, null, 2) : `${res.ok ? '✅' : '❌'} ${res.message}`);
+      } else {
+        const info = await fetchInviteInfo(active);
+        if (isJson) {
+          console.log(JSON.stringify(info, null, 2));
+        } else {
+          console.log(`\n🎁 我的邀请码: ${info.inviteCode}`);
+          console.log(`🔗 专属链接: ${info.inviteUrl}`);
+          console.log(`👥 已邀请人数: ${info.invitedCount} | 累计奖励积分: ${info.rewardCredit}\n`);
+        }
+      }
+      break;
+    }
+
+    case 'unfreeze': {
+      let count = 0;
+      for (const acc of store.getAll()) {
+        if (acc.disabled) {
+          store.setDisabled(acc.account.uid, false, '');
+          count++;
+        }
+      }
+      // 通知运行中的网关清除全部内存冷却
+      try {
+        const res = await fetch('http://127.0.0.1:7863/plugins/dsh-workbuddy2api/accounts/clear-all-cooldowns', {
+          method: 'POST',
+          signal: AbortSignal.timeout(3000)
+        });
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`✅ 网关运行态熔断已清理 (${data.cleared} 条)`);
+        }
+      } catch (_) {}
+      console.log(`✅ 已解除 ${count} 个已停用账号锁定状态`);
+      break;
+    }
+
+    case 'import': {
+      const filePath = args.find((a) => !a.startsWith('--'));
+      if (!filePath || !fs.existsSync(filePath)) {
+        console.error('❌ 请提供有效的导入文件路径 (.zip / .json / .txt)');
+        process.exit(1);
+      }
+      const realmArg = args.includes('--cn') ? 'cn' : 'global';
+      const buf = fs.readFileSync(filePath);
+      const res = await batchImportAccounts(buf, store, client, realmArg);
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
+    case 'export': {
+      const outPath = args.find((a) => !a.startsWith('--')) || path.join(process.cwd(), 'workbuddy2api-backup.zip');
+      const zipBuf = exportBackupZip(store);
+      fs.writeFileSync(outPath, zipBuf);
+      console.log(`✅ 已导出 ${store.getAll().length} 个账号至: ${outPath}`);
+      break;
+    }
+
     case 'doctor': {
       console.log('\n=== WorkBuddy 2API 环境诊断 ===');
       console.log(`Node.js 版本: ${process.version}`);
@@ -332,6 +419,11 @@ DSH WorkBuddy 2API CLI 命令行工具
   models [--json]      向上游拉取当前账号真实可用模型清单
   usage  [--json]      查看今日与近 7 天本机 Token 消耗与走势
   checkin              为当前激活账号执行每日签到或福利领取
+  trial                🎁 为所有国际版 (Global) 账号领取 IDE Trial 加速包
+  invite [bind <code>] 查看专属邀请码或绑定受邀码
+  unfreeze             🔓 解锁停用账号并通知网关清除运行态熔断冷却
+  import <file>        📥 从 .zip / .json / .txt 批量验证导入账号
+  export [out.zip]     📦 导出全池账号为 ZIP 备份包
   travel [subcmd]      🐱 猫猫旅行管家 (status / depart / claim / run)
   welfare [subcmd]     🎁 活动福利体系 (claim / streak / draw)
   tasks [subcmd]       📋 成长任务引擎 (list / run - 自动点亮+领奖)

@@ -1,23 +1,26 @@
 /**
- * ComposerDock.jsx - 输入框下方挂载的极速实时积分与 Provider 状态徽章
- * 支持：毫秒级主动刷新、窗口聚焦自动同步、跨组件事件联动、后台静默轮询
+ * ComposerDock.jsx - 输入框下方挂载的极速实时积分、三区合计与 Console 快捷入口
  */
 
 import React, { useState, useEffect, useRef } from 'react';
 
 export function ComposerDock() {
   const [balance, setBalance] = useState(null);
+  const [summary, setSummary] = useState(null);
   const [activeAccount, setActiveAccount] = useState(null);
+  const [gatewayPort, setGatewayPort] = useState(7863);
   const [loading, setLoading] = useState(false);
   const timerRef = useRef(null);
 
-  const fetchStatus = async () => {
+  const fetchStatus = async (forceRefresh = false) => {
     try {
       setLoading(true);
-      const res = await fetch('/plugins/dsh-workbuddy2api/status');
+      const res = await fetch(`/plugins/dsh-workbuddy2api/status${forceRefresh ? '?refresh=1' : ''}`);
       if (res.ok) {
         const data = await res.json();
         setBalance(data.balance);
+        setSummary(data.summary || null);
+        if (data.gatewayPort) setGatewayPort(data.gatewayPort);
         const active = data.accounts?.find((a) => a.uid === data.activeUid);
         setActiveAccount(active);
       }
@@ -28,23 +31,15 @@ export function ComposerDock() {
   };
 
   useEffect(() => {
-    // 1. 初始化拉取
-    fetchStatus();
+    fetchStatus(false);
 
-    // 2. 窗口重获焦点时实时同步
-    const handleFocus = () => {
-      fetchStatus();
-    };
+    const handleFocus = () => fetchStatus(false);
+    const handleCustomUpdate = () => fetchStatus(false);
+
     window.addEventListener('focus', handleFocus);
-
-    // 3. 监听全局积分更新广播事件
-    const handleCustomUpdate = () => {
-      fetchStatus();
-    };
     window.addEventListener('wb2a:refresh-balance', handleCustomUpdate);
 
-    // 4. 定时轮询 (每 12 秒静默更新一次)
-    timerRef.current = setInterval(fetchStatus, 12000);
+    timerRef.current = setInterval(() => fetchStatus(false), 12000);
 
     return () => {
       window.removeEventListener('focus', handleFocus);
@@ -56,6 +51,10 @@ export function ComposerDock() {
   const formattedRemain = typeof balance?.remain === 'number'
     ? balance.remain.toLocaleString()
     : (balance?.remain ?? '就绪');
+
+  const poolTotal = typeof summary?.all?.remain === 'number'
+    ? summary.all.remain.toLocaleString()
+    : null;
 
   return (
     <div className="wb2a-dock-line">
@@ -73,12 +72,17 @@ export function ComposerDock() {
         >
           {formattedRemain}
         </strong>
+        {poolTotal && (
+          <span style={{ color: '#64748b', marginLeft: 4 }}>
+            (全池 {poolTotal})
+          </span>
+        )}
       </span>
       {activeAccount && (
         <>
           <span>·</span>
           <span style={{ color: '#cbd5e1' }}>
-            账号: {activeAccount.nickname || activeAccount.uid.slice(0, 8)} ({activeAccount.realm})
+            {activeAccount.nickname || activeAccount.uid.slice(0, 8)} ({activeAccount.realm})
           </span>
         </>
       )}
@@ -95,12 +99,26 @@ export function ComposerDock() {
           transition: 'transform 0.3s ease',
           transform: loading ? 'rotate(180deg)' : 'none'
         }}
-        onClick={fetchStatus}
+        onClick={() => fetchStatus(true)}
         disabled={loading}
-        title="立即从上游刷新最新积分"
+        title="立即从上游刷新全池最新积分"
       >
-        ↻
+        ⟳
       </button>
+      <a
+        href={`http://127.0.0.1:${gatewayPort}/console`}
+        target="_blank"
+        rel="noreferrer"
+        style={{
+          color: '#38bdf8',
+          textDecoration: 'none',
+          fontSize: 11,
+          marginLeft: 2
+        }}
+        title="打开独立 Cyberpunk Web 控制台"
+      >
+        控制台↗
+      </a>
     </div>
   );
 }

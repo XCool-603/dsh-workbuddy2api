@@ -30,9 +30,10 @@ export async function performCheckin(account, fetchFn = fetch) {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
         'X-User-Id': account.account?.uid || '',
+        'X-CodeBuddy-Request': '1',
         'Origin': base,
         'Referer': `${base}/`,
-        'User-Agent': 'WorkBuddy/1.2.34'
+        'User-Agent': 'WorkBuddy/5.5.4'
       },
       body: JSON.stringify({})
     });
@@ -42,16 +43,21 @@ export async function performCheckin(account, fetchFn = fetch) {
     const low = msg.toLowerCase();
 
     if (res.ok && (data.code === 0 || data.code === 200)) {
-      return { ok: true, status: 'SUCCESS', message: isGlobal ? '试用额度领取成功' : '签到成功' };
+      return { ok: true, status: 'SUCCESS', message: isGlobal ? '试用额度领取成功 (+Trial)' : '签到成功' };
     }
 
     if (
       low.includes('已签到') ||
       low.includes('already') ||
       data.code === 10001 ||
-      data.code === 14001
+      data.code === 14001 ||
+      data.code === 14051
     ) {
-      return { ok: true, status: 'ALREADY', message: '今日已完成签到' };
+      return {
+        ok: true,
+        status: 'ALREADY',
+        message: isGlobal ? '试用加速包此前已领取过' : '今日已完成签到'
+      };
     }
 
     return {

@@ -1,16 +1,31 @@
 /**
- * account-store.js - 多账号凭据存储、自动探测导入与持久化
+ * account-store.js - 多账号凭据存储、自动探测导入、启停与持久化
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+export function parseJWTClaims(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+    const decoded = Buffer.from(b64 + pad, 'base64').toString('utf8');
+    return JSON.parse(decoded);
+  } catch (_) {
+    return null;
+  }
+}
+
 export class AccountStore {
   constructor(options = {}) {
     this.dshHome = options.dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
     this.storePath = path.join(this.dshHome, '.workbuddy2api-accounts.json');
-    this.authDir = options.authDir || 'c:\\Work\\workbody\\workbuddy2api\\auths';
+    this.authDir = options.authDir || '';
+    this.skipDiscovery = Boolean(options.skipDiscovery);
     this.accounts = new Map();
     this.activeUid = null;
     this.init();
@@ -24,6 +39,8 @@ export class AccountStore {
         if (Array.isArray(raw.accounts)) {
           for (const acc of raw.accounts) {
             if (acc.account?.uid) {
+              acc.disabled = Boolean(acc.disabled);
+              acc.disabledReason = acc.disabledReason || '';
               this.accounts.set(acc.account.uid, acc);
             }
           }
@@ -36,23 +53,32 @@ export class AccountStore {
       console.warn('[account-store] 读取主存储异常:', e.message);
     }
 
-    // 2. 自动发现并合并原 workbuddy2api/auths 目录中的已有账号
-    this.importFromAuthDir(this.authDir);
+    if (!this.skipDiscovery) {
+      // 2. 自动发现并合并已有的 auths 目录
+      const probeDirs = [
+        this.authDir,
+        path.join(this.dshHome, 'workbuddy2api-auths'),
+        'c:\\Work\\workbody\\workbuddy2api\\auths',
+        path.join(process.cwd(), 'auths')
+      ].filter(Boolean);
 
-    // 3. 自动探测本机 CodeBuddy CLI 登录态
-    this.importFromCodeBuddyCli();
+      for (const dir of [...new Set(probeDirs)]) {
+        this.importFromAuthDir(dir);
+      }
+
+      // 3. 自动探测本机 CodeBuddy CLI 登录态
+      this.importFromCodeBuddyCli();
+    }
 
     // 确保有激活账号
-    if (!this.activeUid && this.accounts.size > 0) {
-      this.activeUid = this.accounts.keys().next().value;
+    if ((!this.activeUid || !this.accounts.has(this.activeUid)) && this.accounts.size > 0) {
+      const enabledFirst = this.getAll().find((a) => !a.disabled);
+      this.activeUid = enabledFirst?.account?.uid || this.accounts.keys().next().value;
     }
 
     this.save();
   }
 
-  /**
-   * 从 auths 目录导入已有 JSON 账号凭据
-   */
   importFromAuthDir(dirPath) {
     if (!dirPath || !fs.existsSync(dirPath)) return;
     try {
@@ -63,24 +89,27 @@ export class AccountStore {
           const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
           const uid = raw.account?.uid || raw.uid;
           if (uid && !this.accounts.has(uid)) {
+            const realm = raw.auth?.realm || raw.realm || (file.includes('cn') ? 'cn' : 'global');
             const acc = {
               account: {
-                uid: uid,
+                uid,
                 nickname: raw.account?.nickname || raw.nickname || `Account-${uid.slice(0, 8)}`,
-                enterpriseId: raw.account?.enterpriseId || raw.enterpriseId || ''
+                enterpriseId: raw.account?.enterpriseId || raw.enterpriseId || '',
+                provider: raw.account?.provider || raw.provider || ''
               },
               auth: {
-                realm: raw.auth?.realm || raw.realm || 'global',
+                realm,
                 accessToken: raw.auth?.accessToken || raw.accessToken || '',
                 refreshToken: raw.auth?.refreshToken || raw.refreshToken || '',
                 expiresAt: raw.auth?.expiresAt || raw.expiresAt || 0,
                 domain: raw.auth?.domain || raw.domain || ''
               },
+              disabled: Boolean(raw.disabled),
+              disabledReason: raw.disabledReason || '',
               source: 'workbuddy2api-auths',
               updatedAt: Date.now()
             };
             this.accounts.set(uid, acc);
-            console.log(`[account-store] 成功同步导入已有账号: ${uid} (${acc.auth.realm})`);
           }
         } catch (_) {}
       }
@@ -89,9 +118,6 @@ export class AccountStore {
     }
   }
 
-  /**
-   * 自动探测本机 CodeBuddy CLI 凭证
-   */
   importFromCodeBuddyCli() {
     const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
     const cliAuthDir = path.join(localAppData, 'CodeBuddyExtension', 'Data', 'Public', 'auth');
@@ -113,16 +139,17 @@ export class AccountStore {
                 enterpriseId: data.enterpriseId || ''
               },
               auth: {
-                realm: 'cn',
+                realm: data.realm || 'cn',
                 accessToken: token,
                 refreshToken: data.refreshToken || data.refresh_token || '',
                 expiresAt: Date.now() + 3600000 * 2,
                 domain: data.domain || ''
               },
+              disabled: false,
+              disabledReason: '',
               source: 'codebuddy-cli',
               updatedAt: Date.now()
             });
-            console.log(`[account-store] 自动跟随 CodeBuddy CLI 登录账号: ${uid}`);
           }
         } catch (_) {}
       }
@@ -169,16 +196,35 @@ export class AccountStore {
     return false;
   }
 
+  setDisabled(uid, disabled, reason = '') {
+    const acc = this.accounts.get(uid);
+    if (!acc) return false;
+    acc.disabled = Boolean(disabled);
+    acc.disabledReason = disabled ? (reason || '手动停用') : '';
+    acc.updatedAt = Date.now();
+    this.save();
+    return true;
+  }
+
   upsert(account) {
     const uid = account.account?.uid;
     if (!uid) throw new Error('Account must have a valid uid');
-    account.updatedAt = Date.now();
-    this.accounts.set(uid, account);
+    const existing = this.accounts.get(uid);
+    const merged = {
+      ...existing,
+      ...account,
+      account: { ...(existing?.account || {}), ...account.account },
+      auth: { ...(existing?.auth || {}), ...account.auth },
+      disabled: account.disabled !== undefined ? Boolean(account.disabled) : Boolean(existing?.disabled),
+      disabledReason: account.disabledReason ?? existing?.disabledReason ?? '',
+      updatedAt: Date.now()
+    };
+    this.accounts.set(uid, merged);
     if (!this.activeUid) {
       this.activeUid = uid;
     }
     this.save();
-    return account;
+    return merged;
   }
 
   delete(uid) {

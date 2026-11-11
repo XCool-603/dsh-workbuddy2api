@@ -2,7 +2,7 @@
  * index.js - DSH WorkBuddy2API 宿主插件核心入口
  */
 
-import { unwrapConfig } from './config.js';
+import { unwrapConfig, ConfigStore } from './config.js';
 import { AccountStore } from './pool/account-store.js';
 import { Scheduler } from './pool/scheduler.js';
 import { UpstreamClient } from './upstream/client.js';
@@ -14,45 +14,62 @@ import { performCheckin } from './upstream/checkin.js';
 import { runTravelForAccount, getBuddyInfo, getTravelStatus, departTravel, claimTravel } from './upstream/travel.js';
 import { claimAllWelfare, reportActiveChat, getStreak, drawLottery } from './upstream/growth.js';
 import { fetchGrowthTasks, runAllGrowthTasks } from './upstream/tasks.js';
+import { claimGlobalTrial } from './upstream/trial.js';
+import { fetchInviteInfo, bindInviteCode } from './upstream/invite.js';
+import { startOAuthFlow, pollOAuthFlow } from './upstream/oauth.js';
+import { batchImportAccounts, exportBackupZip } from './pool/import-export.js';
 import { PROVIDER_NAME, PROVIDER_ALIAS, SETTINGS_NS } from './constants.js';
 
 export const name = 'dsh-workbuddy2api';
 export const inject = ['webServer'];
 
 export function apply(ctx, rawConfig) {
-  const config = unwrapConfig(rawConfig);
-  ctx.logger?.info?.('🚀 [dsh-workbuddy2api] 正在初始化 WorkBuddy 2API 网关插件...');
+  const configStore = new ConfigStore(rawConfig || {});
+  const cfg = configStore.getAll();
+
+  ctx.logger?.info?.('🚀 [dsh-workbuddy2api] 正在初始化 WorkBuddy 2API 全功能网关插件...');
 
   // 1. 初始化账号存储、上游客户端、调度器与用量账本
-  const store = new AccountStore({ authDir: config.authDir });
+  const store = new AccountStore({ authDir: cfg.authDir });
   const client = new UpstreamClient({
-    proxy: config.proxy,
+    proxy: cfg.proxy,
     onTokenRefresh: (acc) => store.upsert(acc)
   });
   const scheduler = new Scheduler(store, {
-    maxInFlightCN: config.maxInFlightCN,
-    maxInFlightGlobal: config.maxInFlightGlobal
+    client,
+    configStore,
+    maxInFlightCN: cfg.maxInFlightCN,
+    maxInFlightGlobal: cfg.maxInFlightGlobal,
+    queueTimeoutMs: cfg.queueTimeoutMs
   });
   const ledger = new UsageLedger();
 
-  // 2. 初始化并拉起本地 OpenAI 兼容 Loopback 网关
+  // 2. 初始化并拉起本地多协议兼容网关（OpenAI Chat / Anthropic / Responses / Video / Cyberpunk Console）
   const loopback = new LoopbackGateway(scheduler, client, ledger, {
-    port: config.gatewayPort,
-    aliases: config.aliases,
-    enabledModels: config.enabledModels
+    configStore,
+    port: cfg.gatewayPort,
+    apiKey: cfg.apiKey,
+    aliases: cfg.aliases,
+    enabledModels: cfg.enabledModels
   });
 
-  loopback.start().catch((err) => {
-    ctx.logger?.error?.('[dsh-workbuddy2api] Loopback 网关启动异常:', err);
-  });
+  // 3. 注册全量内网管控台路由（同时挂载到 DSH WebServer 与 Loopback Console）
+  registerWebRoutes(ctx, { scheduler, client, ledger, loopback, configStore });
 
-  // 3. 注册 DSH 内部通信 WebServer 路由
-  registerWebRoutes(ctx, { scheduler, client, ledger, loopback });
+  loopback
+    .start()
+    .then(() => {
+      // 网关就绪后静默同步一次上游动态模型目录
+      loopback.refreshDiscoveredModels().catch(() => {});
+    })
+    .catch((err) => {
+      ctx.logger?.error?.('[dsh-workbuddy2api] Loopback 网关启动异常:', err);
+    });
 
   // 4. 注册 DSH 原生 LLM Provider 与 Adapter
   const adapterObj = createWorkBuddyAdapter(
     loopback,
-    () => Array.from(loopback.enabledModels),
+    () => configStore.get('enabledModels') || Array.from(loopback.enabledModels),
     { scheduler, client, ledger, ctx }
   );
   let disposeLlm = null;
@@ -65,13 +82,13 @@ export function apply(ctx, rawConfig) {
     disposeLlm = registerLlmProvider(ctx, adapterObj);
   }
 
-  // 5. 自动每日签到与猫猫旅行排程 (若启用)
+  // 5. 自动每日签到、猫猫旅行与 5 分钟 Token 保活排程
   let startupTimer = null;
-  if (config.autoCheckin !== false) {
-    scheduler.startAutoRoutines();
+  scheduler.startAutoRoutines();
+  if (cfg.autoCheckin !== false) {
     startupTimer = setTimeout(async () => {
       const active = store.getActive();
-      if (active) {
+      if (active && !active.disabled) {
         try {
           ctx.logger?.info?.(`[dsh-workbuddy2api] 启动自动化例行任务：开始执行当前账号 (${active.account.nickname}) 福利与猫猫旅行...`);
           const welfareRes = await claimAllWelfare(active);
@@ -81,9 +98,10 @@ export function apply(ctx, rawConfig) {
         }
       }
     }, 3000);
+    if (startupTimer.unref) startupTimer.unref();
   }
 
-  // 6. 生命周期卸载清理（包含热重载时立即销毁占用端口与定时器）
+  // 6. 生命周期卸载清理（热重载时立即销毁占用的端口与全部定时器）
   ctx.effect?.(() => {
     return () => {
       if (startupTimer) clearTimeout(startupTimer);
@@ -98,6 +116,7 @@ export function apply(ctx, rawConfig) {
 }
 
 export {
+  ConfigStore,
   AccountStore,
   Scheduler,
   UpstreamClient,
@@ -115,6 +134,13 @@ export {
   drawLottery,
   fetchGrowthTasks,
   runAllGrowthTasks,
+  claimGlobalTrial,
+  fetchInviteInfo,
+  bindInviteCode,
+  startOAuthFlow,
+  pollOAuthFlow,
+  batchImportAccounts,
+  exportBackupZip,
   PROVIDER_NAME,
   PROVIDER_ALIAS,
   SETTINGS_NS

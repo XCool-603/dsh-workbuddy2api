@@ -130,4 +130,15 @@ export class UsageLedger {
       hourly
     };
   }
+
+  /**
+   * 重置本地用量统计账本
+   */
+  reset() {
+    this.data = {
+      days: {},
+      summary: { totalRequests: 0, totalInputTokens: 0, totalOutputTokens: 0 }
+    };
+    this.save();
+  }
 }

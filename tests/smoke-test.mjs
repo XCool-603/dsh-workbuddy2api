@@ -3,11 +3,26 @@
  */
 
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { AccountStore } from '../src/pool/account-store.js';
+import { ConfigStore } from '../src/config.js';
 import { Scheduler } from '../src/pool/scheduler.js';
 import { UpstreamClient } from '../src/upstream/client.js';
 import { UsageLedger } from '../src/pool/ledger.js';
 import { LoopbackGateway } from '../src/server/loopback.js';
+import { registerWebRoutes } from '../src/server/web-routes.js';
+import { createSSELinePump } from '../src/server/sse.js';
+import { anthropicToOpenAI, openAIToAnthropicResponse } from '../src/server/messages.js';
+import { responsesToChatPayload, chatCompletionToResponseObject } from '../src/server/responses.js';
+import {
+  buildZipBuffer,
+  parseZipEntries,
+  extractAccountCandidates,
+  exportBackupZip
+} from '../src/pool/import-export.js';
+import { ErrKind } from '../src/constants.js';
 import { normalizeReasoningEffort } from '../src/upstream/efforts.js';
 import { isVideoModel } from '../src/upstream/video.js';
 import { createWorkBuddyAdapter } from '../src/adapter/pi-ai-adapter.js';
@@ -173,4 +188,254 @@ assert.strictEqual(outbound.thinking?.type, 'enabled');
 console.log('   ✓ 官方通道校验头、工具透传与防 11128 拦截全部验证通过');
 
 loopback.stop();
-console.log('\n🎉 所有自动化冒烟测试全部通过！');
+
+// 11. 测试 ConfigStore 持久化读写
+console.log('11. 测试 ConfigStore 持久化配置...');
+const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-test-'));
+const cfgStore1 = new ConfigStore({}, { dshHome: tmpHome });
+cfgStore1.update({ maxInFlightCN: 5, apiKey: 'test-key-123', promptMode: 'append', promptText: 'Stay concise' });
+const cfgStore2 = new ConfigStore({}, { dshHome: tmpHome });
+assert.strictEqual(cfgStore2.get('maxInFlightCN'), 5);
+assert.strictEqual(cfgStore2.get('apiKey'), 'test-key-123');
+assert.strictEqual(cfgStore2.get('promptMode'), 'append');
+console.log('   ✓ ConfigStore 持久化与重载正常');
+
+// 12. 测试多格式导入与 ZIP 压缩包备份往返
+console.log('12. 测试卡密/JSON 多格式解析与 ZIP 备份包往返...');
+const cardText = `
+# 注释行应被跳过
+// 双斜杠注释也跳过
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1aWRfMSIsImlzcyI6IndvcmtidWRkeSJ9.sig----ref_tok_1
+[{"account":{"uid":"uid_2","nickname":"N2"},"auth":{"realm":"cn","accessToken":"tok2","refreshToken":"ref2"}}]
+`;
+const parsedCards = extractAccountCandidates(cardText, 'global');
+assert.strictEqual(parsedCards.length, 2, '应精确提取卡密和 JSON 两条账号');
+assert.strictEqual(parsedCards[0].account.uid, 'uid_1');
+assert.strictEqual(parsedCards[1].auth.realm, 'cn');
+
+const zipBuf = buildZipBuffer([
+  { name: 'cn-uid_2.json', content: JSON.stringify(parsedCards[1]) }
+]);
+const unzipped = parseZipEntries(zipBuf);
+assert.strictEqual(unzipped.length, 1);
+assert.ok(unzipped[0].content.toString('utf8').includes('uid_2'));
+console.log('   ✓ ZIP 读写与卡密/JSON 解析验证通过');
+
+// 13. 测试 Scheduler 升级（停用过滤、模型级软熔断、Sticky、并发排队）
+console.log('13. 测试调度器模型级软熔断、Sticky 路由与并发排队...');
+const isoStore = new AccountStore({ dshHome: tmpHome, skipDiscovery: true });
+isoStore.upsert({
+  account: { uid: 'acc-1', nickname: 'A1' },
+  auth: { realm: 'global', accessToken: 't1', refreshToken: 'r1' }
+});
+isoStore.upsert({
+  account: { uid: 'acc-2', nickname: 'A2' },
+  auth: { realm: 'global', accessToken: 't2', refreshToken: 'r2' },
+  disabled: true
+});
+const sched2 = new Scheduler(isoStore, { maxInFlightCN: 1, maxInFlightGlobal: 1, configStore: cfgStore2 });
+const cands = sched2.pickCandidates('global', { sessionKey: 's1', bareModel: 'gpt-6-astra' });
+assert.strictEqual(cands.length, 1, '已停用账号 acc-2 必须被调度剔除');
+assert.strictEqual(cands[0].account.uid, 'acc-1');
+
+// 模型级软熔断仅冷却 gpt-6-astra，不影响 deepseek-v4.1-flash
+sched2.recordFailure(cands[0], ErrKind.SOFT_RATE, '429', 'global:gpt-6-astra');
+assert.strictEqual(sched2.isCoolingDown('acc-1', 'gpt-6-astra'), true);
+assert.strictEqual(sched2.isCoolingDown('acc-1', 'deepseek-v4.1-flash'), false);
+assert.strictEqual(sched2.clearAllCooldowns() > 0, true);
+assert.strictEqual(sched2.isCoolingDown('acc-1', 'gpt-6-astra'), false);
+
+// 并发排队：占用唯一槽位并在 60ms 后释放，验证 acquireWithQueue 唤醒并获取成功
+const acc1 = isoStore.get('acc-1');
+assert.strictEqual(sched2.acquire(acc1), true);
+setTimeout(() => sched2.release(acc1), 60);
+const queuedGot = await sched2.acquireWithQueue(() => sched2.pickCandidates('global'), 1000);
+assert.ok(queuedGot && queuedGot.account.uid === 'acc-1', '排队等待应在释放后立即获得槽位');
+sched2.release(acc1);
+console.log('   ✓ 调度器停用过滤、模型级熔断与 FIFO 排队唤醒全部通过');
+
+// 14. 测试 SSE 行缓冲与心跳隔离防污染
+console.log('14. 测试 SSE 行缓冲切片与真实 usage 提取...');
+const writtenChunks = [];
+const mockRes = {
+  writableEnded: false,
+  destroyed: false,
+  write(str) { writtenChunks.push(str); }
+};
+const pump = createSSELinePump(mockRes, { forwardRaw: true, heartbeatMs: 40 });
+pump.push('data: {"id":"1","choices":[{"delta":{"content":"Hel');
+// 半包 JSON 尚未闭合，等待超过 40ms 心跳周期，绝不能写入 `: ping\n\n`
+await new Promise((r) => setTimeout(r, 70));
+assert.strictEqual(writtenChunks.length, 0, '半包 JSON 未结束时绝不能提前吐出心跳污染帧');
+pump.push('lo"}}],"usage":{"prompt_tokens":12,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":8}}}\n\ndata: [DONE]\n\n');
+pump.finish();
+pump.stop();
+assert.ok(writtenChunks[0].includes('"content":"Hello"'), '完整闭合帧应无损透传');
+const pumpUsage = pump.getUsage();
+assert.strictEqual(pumpUsage.promptTokens, 12);
+assert.strictEqual(pumpUsage.completionTokens, 4);
+assert.strictEqual(pumpUsage.cacheHit, true);
+console.log('   ✓ SSE 事件边界切分、防心跳撕裂与真实 Usage 提取通过');
+
+// 15. 测试 Anthropic /v1/messages 与 OpenAI /v1/responses 协议双向转换
+console.log('15. 测试 Anthropic Messages 与 OpenAI Responses 协议转换...');
+const anthropicReq = {
+  model: 'claude-3-7-sonnet',
+  system: 'You are expert',
+  max_tokens: 1024,
+  thinking: { type: 'enabled', budget_tokens: 10000 },
+  tools: [{ name: 'calc', description: 'math', input_schema: { type: 'object', properties: {} } }],
+  tool_choice: { type: 'tool', name: 'calc' },
+  messages: [
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'hmm' },
+        { type: 'tool_use', id: 'tu_1', name: 'calc', input: { x: 1 } }
+      ]
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'tu_1', content: '2' },
+        { type: 'text', text: 'thanks' }
+      ]
+    }
+  ]
+};
+const convertedOpenAI = anthropicToOpenAI(anthropicReq);
+assert.strictEqual(convertedOpenAI.messages[0].role, 'system');
+assert.strictEqual(convertedOpenAI.messages[1].tool_calls[0].function.name, 'calc');
+assert.strictEqual(convertedOpenAI.messages[2].role, 'tool');
+assert.strictEqual(convertedOpenAI.messages[3].role, 'user');
+assert.strictEqual(convertedOpenAI.reasoning_effort, 'high');
+
+const antResp = openAIToAnthropicResponse({
+  id: 'c1',
+  model: 'global:gpt-6-astra',
+  choices: [{
+    finish_reason: 'tool_calls',
+    message: {
+      reasoning_content: 'thought',
+      content: 'ok',
+      tool_calls: [{ id: 'tc1', function: { name: 'calc', arguments: '{"x":1}' } }]
+    }
+  }],
+  usage: { prompt_tokens: 10, completion_tokens: 5 }
+}, 'claude-3-7-sonnet');
+assert.strictEqual(antResp.type, 'message');
+assert.strictEqual(antResp.stop_reason, 'tool_use');
+assert.strictEqual(antResp.content.length, 3);
+
+const respPayload = responsesToChatPayload({
+  model: 'gpt-4o',
+  instructions: 'sys',
+  input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+  max_output_tokens: 500
+});
+assert.strictEqual(respPayload.messages[0].role, 'system');
+assert.strictEqual(respPayload.messages[1].content, 'hi');
+const respObj = chatCompletionToResponseObject({
+  choices: [{ message: { content: 'pong' }, finish_reason: 'stop' }],
+  usage: { prompt_tokens: 2, completion_tokens: 1 }
+}, 'gpt-4o');
+assert.strictEqual(respObj.object, 'response');
+assert.strictEqual(respObj.output_text, 'pong');
+console.log('   ✓ Anthropic & Responses 协议双向转换验证通过');
+
+// 16. 测试 Loopback 多协议网关与 WebRoutes 端到端集成 (/console, auth, /v1/messages, /v1/chat/completions)
+console.log('16. 测试 Loopback + WebRoutes + Cyberpunk Console 端到端集成...');
+const isoLedger = new UsageLedger({ dshHome: tmpHome });
+const mockUpstreamClient = {
+  proxy: '',
+  classifyError: () => ErrKind.CLIENT,
+  fetchBalance: async () => ({
+    remain: 888, total: 1000, used: 112,
+    baseRemain: 500, bonusRemain: 388, purchasedRemain: 0, expiringRemain: 0,
+    packCount: 2, activePackCount: 2, packages: [], fetchedAt: Date.now()
+  }),
+  fetchModels: async () => [],
+  chatStream: async () => {
+    const encoder = new TextEncoder();
+    const sseText =
+      'data: {"id":"ch1","choices":[{"index":0,"delta":{"content":"DSH "},"finish_reason":null}]}\n\n' +
+      'data: {"id":"ch1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":5}}\n\n' +
+      'data: [DONE]\n\n';
+    const bodyStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(sseText));
+        controller.close();
+      }
+    });
+    return { ok: true, status: 200, bodyStream, isVideo: false };
+  }
+};
+const gw2 = new LoopbackGateway(sched2, mockUpstreamClient, isoLedger, {
+  configStore: cfgStore2,
+  port: 0
+});
+registerWebRoutes(null, { scheduler: sched2, client: mockUpstreamClient, ledger: isoLedger, loopback: gw2, configStore: cfgStore2 });
+const p2 = await gw2.start();
+
+// 检查 Cyberpunk Console HTML
+const consoleHtmlRes = await fetch(`http://127.0.0.1:${p2}/console`);
+assert.strictEqual(consoleHtmlRes.status, 200);
+const htmlText = await consoleHtmlRes.text();
+assert.ok(htmlText.includes('WORKBUDDY 2API'), 'Cyberpunk Console 页面必须成功渲染');
+
+// 检查内网管理 status + 3-realm summary
+const stRes = await fetch(`http://127.0.0.1:${p2}/plugins/dsh-workbuddy2api/status?refresh=1`);
+const stJson = await stRes.json();
+assert.strictEqual(stJson.ok, true);
+assert.strictEqual(stJson.summary.global.count, 2);
+assert.strictEqual(stJson.summary.global.enabledCount, 1);
+assert.strictEqual(stJson.summary.global.remain, 1776);
+
+// 检查网关 API Key 鉴权拦截 (401)
+const unauthRes = await fetch(`http://127.0.0.1:${p2}/v1/models`);
+assert.strictEqual(unauthRes.status, 401);
+
+// 带有效 API Key 调用 /v1/chat/completions 与 /v1/messages
+const authHdr = { 'Authorization': 'Bearer test-key-123', 'Content-Type': 'application/json' };
+const chatTestRes = await fetch(`http://127.0.0.1:${p2}/v1/chat/completions`, {
+  method: 'POST',
+  headers: authHdr,
+  body: JSON.stringify({ model: 'auto-free', messages: [{ role: 'user', content: 'hi' }] })
+});
+assert.strictEqual(chatTestRes.status, 200);
+const chatTestJson = await chatTestRes.json();
+assert.strictEqual(chatTestJson.choices[0].message.content, 'DSH OK');
+assert.strictEqual(chatTestJson.usage.completion_tokens, 5);
+
+const antTestRes = await fetch(`http://127.0.0.1:${p2}/v1/messages`, {
+  method: 'POST',
+  headers: { 'x-api-key': 'test-key-123', 'Content-Type': 'application/json' },
+  body: JSON.stringify({ model: 'claude-3-7-sonnet', messages: [{ role: 'user', content: 'hi' }] })
+});
+assert.strictEqual(antTestRes.status, 200);
+const antTestJson = await antTestRes.json();
+assert.strictEqual(antTestJson.type, 'message');
+assert.strictEqual(antTestJson.content[0].text, 'DSH OK');
+
+const respTestRes = await fetch(`http://127.0.0.1:${p2}/v1/responses`, {
+  method: 'POST',
+  headers: authHdr,
+  body: JSON.stringify({ model: 'gpt-4o', input: 'hi' })
+});
+assert.strictEqual(respTestRes.status, 200);
+const respTestJson = await respTestRes.json();
+assert.strictEqual(respTestJson.object, 'response');
+assert.strictEqual(respTestJson.output_text, 'DSH OK');
+
+// 确认 ZIP 导出端到端响应
+const zipHttpRes = await fetch(`http://127.0.0.1:${p2}/plugins/dsh-workbuddy2api/accounts/export.zip`);
+assert.strictEqual(zipHttpRes.status, 200);
+const zipBytes = Buffer.from(await zipHttpRes.arrayBuffer());
+assert.strictEqual(parseZipEntries(zipBytes).length, 2);
+
+gw2.stop();
+sched2.stopAutoRoutines();
+fs.rmSync(tmpHome, { recursive: true, force: true });
+console.log('   ✓ Loopback + WebRoutes + Console + 多协议网关集成测试全部通过');
+
+console.log('\n🎉 所有 16 项自动化全功能验证测试全部通过！');

@@ -263,12 +263,23 @@ export class UpstreamClient {
 
     const raw = data.data || {};
     let remain = 0;
-    let packages = [];
+    let total = 0;
+    let used = 0;
+    let baseRemain = 0;
+    let bonusRemain = 0;
+    let purchasedRemain = 0;
+    let expiringRemain = 0;
+    let packCount = 0;
+    let activePackCount = 0;
+    const packages = [];
+    const nowMs = Date.now();
+    const soonWindowMs = 7 * 86400 * 1000;
 
     // 1. 优先解析官方腾讯云底层计量账单结构 (Response.Data.Accounts)
     const accounts = raw.Response?.Data?.Accounts || data.Response?.Data?.Accounts || [];
     if (Array.isArray(accounts) && accounts.length > 0) {
       for (const a of accounts) {
+        packCount++;
         let pRemain = 0;
         let pSize = 0;
         let pUsed = 0;
@@ -283,73 +294,122 @@ export class UpstreamClient {
         }
 
         remain += pRemain;
+        total += pSize;
+        used += pUsed;
+
+        const pkgName = String(a.PackageName || '积分包');
+        const lowName = pkgName.toLowerCase();
+        if (lowName.includes('subscription') || lowName.includes('订阅') || lowName.includes('free plan') || lowName.includes('base')) {
+          baseRemain += pRemain;
+        } else if (lowName.includes('bonus') || lowName.includes('gift') || lowName.includes('试用') || lowName.includes('赠送') || lowName.includes('活动') || lowName.includes('trial')) {
+          bonusRemain += pRemain;
+        } else {
+          purchasedRemain += pRemain;
+        }
+
+        const expireStr = a.CycleEndTime || a.ExpiredTime || '';
+        if (expireStr && pRemain > 0) {
+          const expMs = Date.parse(expireStr);
+          if (!Number.isNaN(expMs) && expMs > nowMs && expMs - nowMs <= soonWindowMs) {
+            expiringRemain += pRemain;
+          }
+        }
+
         if (pRemain > 0 || (a.Status !== 3 && pSize > 0)) {
+          activePackCount++;
           packages.push({
-            name: a.PackageName || '积分包',
+            name: pkgName,
             remain: pRemain,
             used: pUsed,
             size: pSize,
-            expireTime: a.CycleEndTime || a.ExpiredTime || ''
+            expireTime: expireStr
           });
         }
       }
     } else if (Array.isArray(raw.userPackageList)) {
       for (const p of raw.userPackageList) {
-        remain += p.remain || 0;
+        packCount++;
+        const pr = p.remain || 0;
+        const pu = p.used || 0;
+        remain += pr;
+        used += pu;
+        total += pr + pu;
+        bonusRemain += pr;
+        if (pr > 0) activePackCount++;
         packages.push({
           name: p.packageName || p.name || '积分包',
-          remain: p.remain || 0,
-          used: p.used || 0,
+          remain: pr,
+          used: pu,
+          size: pr + pu,
           expireTime: p.expireTime || p.expiresAt || ''
         });
       }
     } else {
       remain = raw.totalRemain ?? raw.remain ?? raw.points ?? 0;
+      total = remain;
     }
 
     return {
-      remain,
+      remain: Math.round(remain * 100) / 100,
+      total: Math.round(total * 100) / 100,
+      used: Math.round(used * 100) / 100,
+      baseRemain: Math.round(baseRemain * 100) / 100,
+      bonusRemain: Math.round(bonusRemain * 100) / 100,
+      purchasedRemain: Math.round(purchasedRemain * 100) / 100,
+      expiringRemain: Math.round(expiringRemain * 100) / 100,
+      packCount,
+      activePackCount,
       packages,
       fetchedAt: Date.now()
     };
   }
 
   /**
-   * 向上游发现真实可用模型
+   * 向上游发现真实可用模型（合并 V2 / V3 / CN 模型目录）
    */
   async fetchModels(account) {
+    const isGlobal = account.auth?.realm === 'global';
     const base = this.getChatBase(account);
+    const prefix = isGlobal ? 'global:' : 'cn:';
     const models = [];
     const seen = new Set();
 
-    // 1. 尝试探测 V3 Config 端点
-    try {
-      const v3Res = await fetch(`${base}${V3_CONFIG_PATH}`, {
-        headers: this.buildHeaders(account, false),
-        signal: AbortSignal.timeout(8000)
+    const addItem = (item) => {
+      const bare = item.id || item.model || item.name;
+      if (!bare || item.disabled) return;
+      const fullId = /^(cn:|global:)/i.test(bare) ? bare : `${prefix}${bare}`;
+      if (seen.has(fullId)) return;
+      seen.add(fullId);
+      models.push({
+        id: fullId,
+        bareId: bare,
+        realm: isGlobal ? 'global' : 'cn',
+        name: item.displayName || item.name || bare,
+        contextWindow: item.maxInputTokens || item.contextWindow || item.context_length || 200000,
+        maxTokens: item.maxOutputTokens || item.maxTokens || 32000,
+        supportsImages: Boolean(item.supportsImages ?? item.multimodal ?? true),
+        supportedEfforts: item.reasoning?.efforts || item.supportedEfforts || null,
+        rate: item.rate || '标准'
       });
-      if (v3Res.ok) {
-        const v3Data = await v3Res.json().catch(() => ({}));
-        const list = v3Data.data?.models || v3Data.models || [];
-        for (const item of list) {
-          const id = item.id || item.name;
-          if (id && !item.disabled && !seen.has(id)) {
-            seen.add(id);
-            models.push({
-              id,
-              name: item.displayName || item.name || id,
-              contextWindow: item.contextWindow || 200000,
-              maxTokens: item.maxTokens || 32000,
-              supportsImages: Boolean(item.supportsImages || item.multimodal),
-              rate: item.rate || '标准'
-            });
-          }
-        }
-      }
-    } catch (_) {}
+    };
 
-    // 2. 尝试探测 CN 插件 Auth 端点
-    if (models.length === 0) {
+    // 1. 探测 /v3/config 与 /v2/models
+    for (const path of [V3_CONFIG_PATH, '/v2/models']) {
+      try {
+        const res = await fetch(`${base}${path}`, {
+          headers: this.buildHeaders(account, false),
+          signal: AbortSignal.timeout(8000)
+        });
+        if (res.ok) {
+          const json = await res.json().catch(() => ({}));
+          const list = json.data?.models || json.models || (Array.isArray(json.data) ? json.data : []);
+          for (const item of list) addItem(item);
+        }
+      } catch (_) {}
+    }
+
+    // 2. 探测 CN 插件 /v2/plugin/auth/models 端点
+    if (!isGlobal || models.length === 0) {
       try {
         const cnRes = await fetch(`${base}${CN_MODELS_PATH}`, {
           headers: this.buildHeaders(account, false),
@@ -357,21 +417,8 @@ export class UpstreamClient {
         });
         if (cnRes.ok) {
           const cnData = await cnRes.json().catch(() => ({}));
-          const list = cnData.data || [];
-          for (const item of list) {
-            const id = item.id || item.model;
-            if (id && !seen.has(id)) {
-              seen.add(id);
-              models.push({
-                id,
-                name: item.name || id,
-                contextWindow: item.context_length || 200000,
-                maxTokens: 32000,
-                supportsImages: true,
-                rate: item.rate || '标准'
-              });
-            }
-          }
+          const list = Array.isArray(cnData.data) ? cnData.data : (cnData.data?.models || []);
+          for (const item of list) addItem(item);
         }
       } catch (_) {}
     }
@@ -445,8 +492,35 @@ export class UpstreamClient {
     }
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      const kind = this.classifyError(res.status, errText);
+      let errText = await res.text().catch(() => '');
+      let kind = this.classifyError(res.status, errText);
+
+      // 若遇到内容策略 / 11128 拦截，自动使用中性精简 System Prompt 进行降级自愈重试一次
+      if (kind === ErrKind.CONTENT_BLOCKED || res.status === 403) {
+        const degradedMsgs = upstreamBody.messages.map((m) =>
+          m.role === 'system' ? { ...m, content: 'You are a helpful AI coding assistant.' } : m
+        );
+        const degradedBody = { ...upstreamBody, messages: degradedMsgs };
+        try {
+          const degRes = await fetch(url, {
+            method: 'POST',
+            headers: this.buildHeaders(account, true, chatMeta),
+            body: JSON.stringify(degradedBody),
+            signal
+          });
+          if (degRes.ok) {
+            return {
+              ok: true,
+              status: degRes.status,
+              response: degRes,
+              bodyStream: degRes.body
+            };
+          }
+          errText = await degRes.text().catch(() => errText);
+          kind = this.classifyError(degRes.status, errText);
+        } catch (_) {}
+      }
+
       return {
         ok: false,
         status: res.status,
