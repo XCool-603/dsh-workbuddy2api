@@ -26,12 +26,45 @@ export class Scheduler {
     this.circuitBreakers = new Map(); // uid -> { failures, cooldownUntil, kind, reason }
     this.modelBreakers = new Map();   // `${uid}::${bareModel}` -> { failures, cooldownUntil, kind, reason }
     this.inFlight = new Map();        // uid -> current concurrent count
+    this.inFlightRequests = new Map();// reqId -> { id, uid, nickname, realm, model, rate, mode, startedAt }
+    this.accountCredits = new Map();  // uid -> { remain, expiringRemain, updatedAt }
     this.stickyMap = new Map();       // `${sessionKey}::${bareModel}` -> { uid, expiresAt }
     this.accountStats = new Map();    // uid -> { successCount, failCount, lastSuccessAt, lastErrorAt, lastErrorMsg, lastModel }
     this.waiters = [];
 
     this.autoTimer = null;
     this.keepaliveTimer = null;
+  }
+
+  updateAccountCredits(uid, remain = 0, expiringRemain = 0) {
+    if (!uid) return;
+    this.accountCredits.set(uid, {
+      remain: Number(remain || 0),
+      expiringRemain: Number(expiringRemain || 0),
+      updatedAt: Date.now()
+    });
+  }
+
+  beginInFlight(reqId, info) {
+    if (!reqId) return;
+    this.inFlightRequests.set(reqId, {
+      id: reqId,
+      ...info,
+      startedAt: Date.now()
+    });
+  }
+
+  endInFlight(reqId) {
+    if (!reqId) return;
+    this.inFlightRequests.delete(reqId);
+  }
+
+  getInFlightRequests() {
+    const now = Date.now();
+    return [...this.inFlightRequests.values()].map((r) => ({
+      ...r,
+      elapsedMs: now - (r.startedAt || now)
+    }));
   }
 
   _getLimits() {
@@ -373,6 +406,12 @@ export class Scheduler {
     const bareModel = stripModelRealm(options.bareModel || '');
     const stickyUid = this._getStickyUid(options.sessionKey, bareModel);
 
+    let maxRemain = 0;
+    for (const acc of accounts) {
+      const c = this.accountCredits.get(acc.account.uid);
+      if (c && c.remain > maxRemain) maxRemain = c.remain;
+    }
+
     const scored = accounts.map((acc) => {
       const uid = acc.account.uid;
       const isGlobal = acc.auth?.realm === 'global';
@@ -414,7 +453,19 @@ export class Scheduler {
         penalty -= 500;
       }
 
-      // 7. 优先活跃账号微调
+      // 7. 三因子余额与快过期积分加权：优先消耗快过期积分，平衡池内积分比例
+      const creditInfo = this.accountCredits.get(uid);
+      if (creditInfo && creditInfo.remain > 0) {
+        if (maxRemain > 0) {
+          penalty -= (creditInfo.remain / maxRemain) * 120;
+        }
+        if (creditInfo.expiringRemain > 0) {
+          const expRatio = Math.min(1, creditInfo.expiringRemain / creditInfo.remain);
+          penalty -= expRatio * 180;
+        }
+      }
+
+      // 8. 优先活跃账号微调
       if (uid === this.store.activeUid) {
         penalty -= 50;
       }

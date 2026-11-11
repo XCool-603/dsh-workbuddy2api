@@ -116,10 +116,21 @@ export class LoopbackGateway {
       enabledModels: Array.isArray(cfg.enabledModels) ? cfg.enabledModels : [...this.enabledModels],
       freeModels: Array.isArray(cfg.freeModels) && cfg.freeModels.length > 0
         ? cfg.freeModels
-        : ['global:deepseek-v4.1-flash', 'cn:hy4free'],
+        : ['global:hy4free', 'cn:hy4free', 'global:hy3', 'cn:hy3', 'global:deepseek-v4.1-flash-sg'],
       promptMode: cfg.promptMode || 'none',
       promptText: cfg.promptText || ''
     };
+  }
+
+  getModelCatalogMap() {
+    const map = new Map();
+    for (const m of this.getMergedModels(true)) {
+      map.set(m.id, m);
+      if (m.bareId && !map.has(m.bareId)) {
+        map.set(m.bareId, m);
+      }
+    }
+    return map;
   }
 
   checkAuth(req, url) {
@@ -145,7 +156,21 @@ export class LoopbackGateway {
     }
 
     if (target === 'auto-free') {
-      target = freeModels[0] || 'global:deepseek-v4.1-flash';
+      const enabledRealms = new Set(
+        this.scheduler.store
+          .getAll()
+          .filter((a) => !a.disabled && !this.scheduler.isCoolingDown(a.account.uid))
+          .map((a) => a.auth?.realm)
+      );
+      const dynamicFree = this.discoveredModels
+        .filter((m) => m.isFree && (enabledRealms.size === 0 || enabledRealms.has(m.realm)))
+        .map((m) => m.id);
+      const pool = [...new Set([...dynamicFree, ...freeModels])];
+      const matched = pool.find((id) => {
+        const r = id.startsWith('global:') ? 'global' : id.startsWith('cn:') ? 'cn' : null;
+        return !r || enabledRealms.size === 0 || enabledRealms.has(r);
+      });
+      target = matched || freeModels[0] || 'global:hy4free';
     }
     return target;
   }
@@ -223,22 +248,29 @@ export class LoopbackGateway {
       if (existing) {
         merged.set(dm.id, {
           ...existing,
-          supportedEfforts: dm.supportedEfforts || existing.supportedEfforts,
+          name: dm.name || existing.name,
+          description: dm.description || existing.description,
+          credits: dm.credits || existing.credits,
+          rate: dm.rate && dm.rate !== '-' ? dm.rate : existing.rate,
+          multiplier: dm.multiplier ?? existing.multiplier,
+          isFree: dm.isFree ?? existing.isFree,
+          badge: dm.badge || existing.badge,
+          vendor: dm.vendor || existing.vendor,
+          tags: dm.tags?.length ? dm.tags : existing.tags,
+          supportsImages: dm.supportsImages ?? existing.supportsImages,
+          supportsReasoning: dm.supportsReasoning ?? existing.supportsReasoning,
+          supportsToolCall: dm.supportsToolCall ?? existing.supportsToolCall,
+          onlyReasoning: dm.onlyReasoning ?? existing.onlyReasoning,
+          supportedEfforts: dm.supportedEfforts?.length ? dm.supportedEfforts : existing.supportedEfforts,
+          defaultEffort: dm.defaultEffort || existing.defaultEffort,
           contextWindow: dm.contextWindow || existing.contextWindow,
           maxTokens: dm.maxTokens || existing.maxTokens,
-          supportsImages: dm.supportsImages ?? existing.supportsImages
+          source: 'upstream'
         });
       } else {
         merged.set(dm.id, {
-          id: dm.id,
-          name: dm.name || dm.id,
-          realm: dm.realm || 'cn',
-          contextWindow: dm.contextWindow || 128000,
-          maxTokens: dm.maxTokens || 32000,
-          supportsImages: !!dm.supportsImages,
-          supportedEfforts: dm.supportedEfforts || [],
-          rate: dm.rate || '动态',
-          badge: '新发现',
+          ...dm,
+          badge: dm.badge || '新发现',
           source: 'discovered'
         });
       }
@@ -251,25 +283,56 @@ export class LoopbackGateway {
     return list;
   }
 
-  getModelsList(includeDisabled = false) {
+  getModelsList(includeDisabled = false, includeBare = false) {
     const { aliases } = this._getRuntimeConfig();
-    const list = this.getMergedModels(includeDisabled).map((m) => ({
-      id: m.id,
-      object: 'model',
-      created: 1726000000,
-      owned_by: m.source === 'discovered' ? 'workbuddy-upstream' : 'workbuddy2api',
-      permission: [],
-      root: m.id,
-      parent: null,
-      realm: m.realm,
-      context_length: m.contextWindow,
-      max_tokens: m.maxTokens,
-      multimodal: m.supportsImages,
-      supported_efforts: m.supportedEfforts || [],
-      billing_rate: m.rate,
-      badge: m.badge || null,
-      source: m.source
-    }));
+    const formatModelEntry = (m, overrideId = null) => {
+      const id = overrideId || m.id;
+      const prefix = m.rate && m.rate !== '-' && m.rate !== '视频' ? `[${m.rate} credit] ` : '';
+      return {
+        id,
+        object: 'model',
+        created: 1726000000,
+        owned_by: m.source === 'discovered' || m.source === 'upstream' ? 'workbuddy-upstream' : 'workbuddy2api',
+        permission: [],
+        root: m.id,
+        parent: overrideId ? m.id : null,
+        name: m.name,
+        description: `${prefix}${m.description || m.name || ''}`.trim(),
+        credits: m.credits || m.rate || '',
+        multiplier: m.multiplier ?? null,
+        is_free: Boolean(m.isFree),
+        billing_rate: m.rate || '-',
+        badge: m.badge || null,
+        vendor: m.vendor || '',
+        tags: m.tags || [],
+        realm: m.realm,
+        context_length: m.contextWindow,
+        max_output_tokens: m.maxTokens,
+        max_tokens: m.maxTokens,
+        multimodal: m.supportsImages,
+        supports_images: Boolean(m.supportsImages),
+        supports_reasoning: Boolean(m.supportsReasoning),
+        supports_tool_call: Boolean(m.supportsToolCall ?? true),
+        only_reasoning: Boolean(m.onlyReasoning),
+        supported_efforts: m.supportedEfforts || [],
+        reasoning_supported_efforts: m.supportedEfforts || [],
+        reasoning_default_effort: m.defaultEffort || '',
+        source: m.source
+      };
+    };
+
+    const rawModels = this.getMergedModels(includeDisabled);
+    const list = rawModels.map((m) => formatModelEntry(m));
+
+    if (includeBare) {
+      const existingIds = new Set(list.map((m) => m.id));
+      for (const m of rawModels) {
+        if (m.bareId && !existingIds.has(m.bareId)) {
+          existingIds.add(m.bareId);
+          list.push(formatModelEntry(m, m.bareId));
+        }
+      }
+    }
 
     for (const [alias, target] of Object.entries(aliases)) {
       if (!list.some((m) => m.id === alias)) {
@@ -356,7 +419,7 @@ export class LoopbackGateway {
           const allAcc = this.scheduler.store.getAll();
           sendJson(res, 200, {
             ok: true,
-            ...this.ledger.getStats(),
+            ...this.ledger.getStats(this.getModelCatalogMap()),
             discoveredModels: this.discoveredModels.length,
             pool: {
               total: allAcc.length,
@@ -372,12 +435,17 @@ export class LoopbackGateway {
           return;
         }
 
-        // 6. 模型列表接口 /v1/models
+        // 6. 模型列表接口 /v1/models (透出完整倍率、思考档位与可选裸模型名)
         if (req.method === 'GET' && (pathname === '/v1/models' || pathname === '/models')) {
           const includeAll = url.searchParams.get('all') === '1';
+          const ua = String(req.headers['user-agent'] || '').toLowerCase();
+          const includeBare =
+            url.searchParams.get('bare') === 'true' ||
+            req.headers['x-include-bare-models'] === 'true' ||
+            /new-api|one-api|openai|langchain/.test(ua);
           sendJson(res, 200, {
             object: 'list',
-            data: this.getModelsList(includeAll)
+            data: this.getModelsList(includeAll, includeBare)
           });
           return;
         }
@@ -494,6 +562,10 @@ export class LoopbackGateway {
       traceId: req.headers['x-trace-id']
     };
     const sessionKey = body.prompt_cache_key || conversationId || '';
+    const reqStartedAt = Date.now();
+    const catalogMap = this.getModelCatalogMap();
+    const modelMeta = catalogMap.get(actualModel) || catalogMap.get(actualModel.replace(/^(cn:|global:)/i, ''));
+    const modelRate = modelMeta?.rate || '-';
 
     try {
       const execution = await this.scheduler.executeWithFailover(
@@ -501,6 +573,19 @@ export class LoopbackGateway {
         async (account) => await this.client.chatStream(account, body, undefined, meta),
         { sessionKey }
       );
+
+      const accUid = execution.account?.account?.uid || '';
+      const accNick = execution.account?.account?.nickname || accUid.slice(0, 8) || '-';
+      const accRealm = execution.account?.auth?.realm || '-';
+      this.scheduler.beginInFlight(reqId, {
+        uid: accUid,
+        nickname: accNick,
+        realm: accRealm,
+        model: actualModel,
+        rate: modelRate,
+        mode: isStream ? 'stream' : 'sync',
+        protocol
+      });
 
       // 1. 视频生成直出桥接（仅限对话形式请求视频模型）
       if (execution.isVideo) {
@@ -540,8 +625,25 @@ export class LoopbackGateway {
               sendJson(res, 200, completion);
             }
           }
-          this.ledger.record(actualModel, 20, 60, false);
+          const durationMs = Date.now() - reqStartedAt;
+          this.ledger.record(actualModel, 20, 60, false, { durationMs, success: true });
+          this.ledger.addRequestLog({
+            model: actualModel,
+            rate: modelRate,
+            mode: isStream ? 'stream' : 'sync',
+            protocol,
+            status: 200,
+            uid: accUid,
+            account: accNick,
+            realm: accRealm,
+            ttfbMs: 0,
+            durationMs,
+            promptTokens: 20,
+            completionTokens: 60,
+            hasCredit: false
+          });
         } finally {
+          this.scheduler.endInFlight(reqId);
           execution.release();
         }
         return;
@@ -551,7 +653,6 @@ export class LoopbackGateway {
       const decoder = new TextDecoder();
       let clientClosed = false;
 
-      // 修复：监听 res.close 且确认尚未 writableEnded，避免 req.close 在 POST 体读完或半途误触释放
       const onResClose = () => {
         if (!res.writableEnded) {
           clientClosed = true;
@@ -560,7 +661,7 @@ export class LoopbackGateway {
       };
       res.on('close', onResClose);
 
-      // 2. 流式转发与协议翻译（使用完整事件界限缓冲泵，杜绝 `: ping` 截断 JSON）
+      // 2. 流式转发与协议翻译
       if (isStream) {
         let emitter = null;
         if (protocol === 'anthropic') {
@@ -573,6 +674,7 @@ export class LoopbackGateway {
 
         const pump = createSSELinePump(res, {
           forwardRaw: protocol === 'chat',
+          startTime: reqStartedAt,
           onEvent: (parsed) => {
             if (emitter && parsed) {
               emitter.pushOpenAIEvent(parsed);
@@ -597,14 +699,32 @@ export class LoopbackGateway {
         } finally {
           pump.stop();
           res.off('close', onResClose);
+          this.scheduler.endInFlight(reqId);
           execution.release();
           const u = pump.getUsage();
-          this.ledger.record(actualModel, u.promptTokens, u.completionTokens, u.cacheHit);
+          const durationMs = Date.now() - reqStartedAt;
+          this.ledger.record(actualModel, u.promptTokens, u.completionTokens, u.cacheHit, {
+            ...u,
+            durationMs,
+            success: !clientClosed
+          });
+          this.ledger.addRequestLog({
+            model: actualModel,
+            rate: modelRate,
+            mode: 'stream',
+            protocol,
+            status: 200,
+            uid: accUid,
+            account: accNick,
+            realm: accRealm,
+            ...u,
+            durationMs
+          });
         }
         return;
       }
 
-      // 3. 非流式全量聚合（保留 text / reasoning_content / tool_calls / usage / finish_reason）
+      // 3. 非流式全量聚合
       let fullText = '';
       let reasoningText = '';
       let finishReason = 'stop';
@@ -613,6 +733,7 @@ export class LoopbackGateway {
       const aggPump = createSSELinePump(null, {
         forwardRaw: false,
         heartbeatMs: 0,
+        startTime: reqStartedAt,
         onEvent: (parsed) => {
           const choice = parsed?.choices?.[0];
           if (!choice) return;
@@ -651,6 +772,7 @@ export class LoopbackGateway {
       } finally {
         aggPump.stop();
         res.off('close', onResClose);
+        this.scheduler.endInFlight(reqId);
         execution.release();
       }
 
@@ -674,6 +796,7 @@ export class LoopbackGateway {
       }
 
       const usage = aggPump.getUsage();
+      const durationMs = Date.now() - reqStartedAt;
       const completionObj = {
         id: reqId,
         object: 'chat.completion',
@@ -683,7 +806,8 @@ export class LoopbackGateway {
         usage: {
           prompt_tokens: usage.promptTokens,
           completion_tokens: usage.completionTokens,
-          total_tokens: usage.promptTokens + usage.completionTokens
+          total_tokens: usage.promptTokens + usage.completionTokens,
+          ...(usage.hasCredit ? { credit: usage.credit } : {})
         }
       };
 
@@ -695,10 +819,41 @@ export class LoopbackGateway {
         sendJson(res, 200, completionObj);
       }
 
-      this.ledger.record(actualModel, usage.promptTokens, usage.completionTokens, usage.cacheHit);
+      this.ledger.record(actualModel, usage.promptTokens, usage.completionTokens, usage.cacheHit, {
+        ...usage,
+        durationMs,
+        success: true
+      });
+      this.ledger.addRequestLog({
+        model: actualModel,
+        rate: modelRate,
+        mode: 'sync',
+        protocol,
+        status: 200,
+        uid: accUid,
+        account: accNick,
+        realm: accRealm,
+        ...usage,
+        durationMs
+      });
     } catch (err) {
+      this.scheduler.endInFlight(reqId);
+      const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+      const durationMs = Date.now() - reqStartedAt;
+      this.ledger.record(actualModel, 0, 0, false, { durationMs, success: false });
+      this.ledger.addRequestLog({
+        model: actualModel,
+        rate: modelRate,
+        mode: isStream ? 'stream' : 'sync',
+        protocol,
+        status,
+        uid: '-',
+        account: '-',
+        realm: '-',
+        durationMs,
+        error: err.message
+      });
       if (!res.headersSent) {
-        const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
         if (protocol === 'anthropic') {
           sendJson(res, status, {
             type: 'error',

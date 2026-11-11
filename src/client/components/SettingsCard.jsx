@@ -46,10 +46,23 @@ export function SettingsCard({ t }) {
   const [tasksList, setTasksList] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
 
-  // 模型管理与别名
+  // 模型管理与倍率筛选
   const [modelSearch, setModelSearch] = useState('');
+  const [modelFilter, setModelFilter] = useState('all');
   const [aliasesDraft, setAliasesDraft] = useState('{}');
-  const [freeModelsDraft, setFreeModelsDraft] = useState('global:deepseek-v4.1-flash, cn:hy4free');
+  const [freeModelsDraft, setFreeModelsDraft] = useState('global:hy4free, cn:hy4free');
+
+  // 积分包明细弹窗 & 在线调试/实时流水
+  const [packsModalAcc, setPacksModalAcc] = useState(null);
+  const [liveLogs, setLiveLogs] = useState([]);
+  const [inFlightList, setInFlightList] = useState([]);
+  const [pgModel, setPgModel] = useState('auto-free');
+  const [pgEffort, setPgEffort] = useState('');
+  const [pgPrompt, setPgPrompt] = useState('你好，请用一句话自我介绍');
+  const [pgOutput, setPgOutput] = useState('等待发送测试请求...');
+  const [pgMetrics, setPgMetrics] = useState('');
+  const [pgRunning, setPgRunning] = useState(false);
+  const [dshInfo, setDshInfo] = useState(null);
 
   // 网关设置表单
   const [cfgDraft, setCfgDraft] = useState({
@@ -152,11 +165,71 @@ export function SettingsCard({ t }) {
     };
   }, []);
 
+  const fetchLogs = async () => {
+    try {
+      const res = await fetch('/plugins/dsh-workbuddy2api/logs');
+      if (res.ok) {
+        const data = await res.json();
+        setLiveLogs(data.logs || []);
+        setInFlightList(data.inFlight || []);
+      }
+    } catch (_) {}
+  };
+
+  const fetchDshCheck = async () => {
+    try {
+      const res = await fetch('/plugins/dsh-workbuddy2api/dsh/check');
+      if (res.ok) setDshInfo(await res.json());
+    } catch (_) {}
+  };
+
+  const handleRunPlayground = async () => {
+    setPgRunning(true);
+    setPgOutput(`⏳ 正在请求 ${pgModel} ...`);
+    setPgMetrics('请求中...');
+    const t0 = Date.now();
+    try {
+      const payload = {
+        model: pgModel || 'auto-free',
+        stream: false,
+        messages: [{ role: 'user', content: pgPrompt.trim() || '你好' }]
+      };
+      if (pgEffort) payload.reasoning_effort = pgEffort;
+      const res = await fetch('/plugins/dsh-workbuddy2api/playground/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        setPgOutput(`❌ HTTP ${res.status}: ${json.error?.message || JSON.stringify(json)}`);
+        setPgMetrics(`失败 (${res.status})`);
+      } else {
+        const msg = json.choices?.[0]?.message || {};
+        const u = json.usage || {};
+        setPgOutput(
+          `${msg.reasoning_content ? `[思考过程]\n${msg.reasoning_content}\n\n[回答正文]\n` : ''}${msg.content || JSON.stringify(json, null, 2)}`
+        );
+        const cr = u.credit !== undefined ? ` · 扣费 ${u.credit}` : '';
+        setPgMetrics(`耗时 ${Date.now() - t0}ms · Tokens ${u.total_tokens || '-'}${cr}`);
+      }
+      fetchLogs();
+      fetchUsage();
+    } catch (e) {
+      setPgOutput(`❌ 请求异常: ${e.message}`);
+      setPgMetrics('异常');
+    } finally {
+      setPgRunning(false);
+    }
+  };
+
   useEffect(() => {
     if (tab === 'activity') fetchActivityPanel();
     if (tab === 'tasks') fetchTasksPanel();
     if (tab === 'models') fetchModels();
+    if (tab === 'playground') { fetchModels(); fetchLogs(); }
     if (tab === 'usage') fetchUsage();
+    if (tab === 'settings') fetchDshCheck();
   }, [tab, selectedUid]);
 
   const handleAddAccount = async () => {
@@ -378,10 +451,11 @@ export function SettingsCard({ t }) {
       <div className="wb2a-tabs" style={{ flexWrap: 'wrap' }}>
         {[
           ['accounts', '总览与账号池'],
+          ['models', '模型与倍率'],
+          ['playground', '在线调试与流水'],
+          ['usage', '用量与扣费'],
           ['activity', '猫猫旅行与福利'],
           ['tasks', '成长任务引擎'],
-          ['models', '模型与别名'],
-          ['usage', '积分与用量'],
           ['settings', '网关设置与接入']
         ].map(([key, label]) => (
           <button
@@ -507,6 +581,9 @@ export function SettingsCard({ t }) {
                       设优先
                     </button>
                   )}
+                  <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => setPacksModalAcc(acc)}>
+                    包明细({bal.activePackCount || 0})
+                  </button>
                   <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => handleAdminAction(acc.uid, 'refresh')}>
                     刷新
                   </button>
@@ -829,7 +906,7 @@ export function SettingsCard({ t }) {
         </div>
       )}
 
-      {/* TAB 4: 模型与别名 */}
+      {/* TAB 4: 模型与倍率 */}
       {tab === 'models' && (
         <div>
           <div className="wb2a-toolbar">
@@ -841,62 +918,108 @@ export function SettingsCard({ t }) {
                 try {
                   const res = await fetch('/plugins/dsh-workbuddy2api/models/discover', { method: 'POST' });
                   const d = await res.json();
-                  setActionMsg(`🔍 模型目录同步成功，总计 ${d.models?.length || 0} 个可用模型`);
+                  setActionMsg(`🔍 实时倍率目录同步完成，总计 ${d.models?.length || 0} 个模型`);
                   await fetchModels();
                 } finally {
                   setLoading(false);
                 }
               }}
             >
-              🔍 从上游动态发现最新模型
+              🔍 同步上游实时倍率目录
             </button>
             <button className="wb2a-btn wb2a-btn-sm" onClick={handleSaveModels} disabled={loading}>
-              💾 保存模型过滤与别名
+              💾 保存启用过滤与别名
             </button>
+            <select
+              className="wb2a-input"
+              style={{ width: 150 }}
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+            >
+              <option value="all">全部模型</option>
+              <option value="free">🎁 仅免费 (x0.00)</option>
+              <option value="low">💎 超省 (≤0.2x)</option>
+              <option value="cn">国内版 (CN)</option>
+              <option value="global">国际版 (Global)</option>
+              <option value="reasoning">支持思考</option>
+            </select>
             <input
               className="wb2a-input"
-              style={{ width: 180 }}
-              placeholder="筛选模型 ID..."
+              style={{ width: 170 }}
+              placeholder="搜索模型 ID / 说明..."
               value={modelSearch}
               onChange={(e) => setModelSearch(e.target.value)}
             />
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 12 }}>
-            <div style={{ maxHeight: 340, overflowY: 'auto', border: '1px solid #dbe5f1', borderRadius: 8, padding: 8, background: '#f8fafc' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1.35fr 1fr', gap: 12 }}>
+            <div style={{ maxHeight: 380, overflowY: 'auto', border: '1px solid #dbe5f1', borderRadius: 8, padding: 8, background: '#f8fafc' }}>
               <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
-                启用模型勾选（全不勾选代表默认全部放行）:
+                模型列表与真实倍率（空勾选代表全部放行，点击试跑可验证连通与扣费）:
               </div>
               {(modelsData.models || [])
-                .filter((m) => !modelSearch || m.id.toLowerCase().includes(modelSearch.toLowerCase()))
-                .map((m) => (
-                  <label
-                    key={m.id}
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      padding: '5px 6px',
-                      borderBottom: '1px solid #e2e8f0',
-                      fontSize: 12,
-                      cursor: 'pointer'
-                    }}
-                  >
-                    <span>
-                      <input
-                        type="checkbox"
-                        checked={(modelsData.enabledModels || []).includes(m.id)}
-                        onChange={() => handleToggleModel(m.id)}
-                        style={{ marginRight: 6 }}
-                      />
-                      <strong>{m.id}</strong>
-                      {m.source === 'discovered' && <span className="wb2a-badge" style={{ marginLeft: 4 }}>动态</span>}
-                    </span>
-                    <span style={{ fontSize: 10, color: '#64748b' }}>
-                      {m.realm} · {m.rate || '-'}
-                    </span>
-                  </label>
-                ))}
+                .filter((m) => {
+                  const q = modelSearch.toLowerCase();
+                  if (q && !(m.id.toLowerCase().includes(q) || (m.name || '').toLowerCase().includes(q) || (m.description || '').toLowerCase().includes(q))) return false;
+                  if (modelFilter === 'free' && !m.isFree && m.multiplier !== 0) return false;
+                  if (modelFilter === 'low' && (m.multiplier === null || m.multiplier === undefined || m.multiplier > 0.2)) return false;
+                  if (modelFilter === 'cn' && m.realm !== 'cn') return false;
+                  if (modelFilter === 'global' && m.realm !== 'global') return false;
+                  if (modelFilter === 'reasoning' && !m.supportsReasoning && !(m.supportedEfforts?.length)) return false;
+                  return true;
+                })
+                .map((m) => {
+                  const isFree = m.isFree || m.multiplier === 0;
+                  const isHigh = typeof m.multiplier === 'number' && m.multiplier > 1.0;
+                  const badgeCls = isFree ? 'wb2a-badge-success' : isHigh ? 'wb2a-badge-warn' : '';
+                  return (
+                    <div
+                      key={m.id}
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        padding: '6px 6px',
+                        borderBottom: '1px solid #e2e8f0',
+                        fontSize: 12,
+                        gap: 6
+                      }}
+                    >
+                      <label style={{ cursor: 'pointer', flex: 1 }}>
+                        <input
+                          type="checkbox"
+                          checked={(modelsData.enabledModels || []).includes(m.id)}
+                          onChange={() => handleToggleModel(m.id)}
+                          style={{ marginRight: 6 }}
+                        />
+                        <strong>{m.id}</strong>
+                        <span className={`wb2a-badge ${badgeCls}`} style={{ marginLeft: 5 }}>
+                          {isFree ? `免费 ${m.rate || 'x0.00'}` : (m.rate || '-')}
+                        </span>
+                        {m.badge && (
+                          <span className="wb2a-badge wb2a-badge-warn" style={{ marginLeft: 4 }}>
+                            {m.badge}
+                          </span>
+                        )}
+                        <div style={{ fontSize: 10, color: '#64748b', marginLeft: 20 }}>
+                          {m.realm} · {Math.round((m.contextWindow || 0) / 1000)}k
+                          {m.supportsImages ? ' · 视觉' : ''}
+                          {(m.supportsReasoning || m.supportedEfforts?.length) ? ' · 思考' : ''}
+                          {m.supportedEfforts?.length ? ` [${m.supportedEfforts.join('/')}]` : ''}
+                        </div>
+                      </label>
+                      <button
+                        className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                        onClick={() => {
+                          setPgModel(m.id);
+                          setTab('playground');
+                        }}
+                      >
+                        试跑
+                      </button>
+                    </div>
+                  );
+                })}
             </div>
 
             <div>
@@ -910,7 +1033,7 @@ export function SettingsCard({ t }) {
               <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>客户端模型别名映射表 (JSON):</div>
               <textarea
                 className="wb2a-input"
-                rows={12}
+                rows={13}
                 value={aliasesDraft}
                 onChange={(e) => setAliasesDraft(e.target.value)}
                 style={{ fontFamily: 'monospace' }}
@@ -920,13 +1043,90 @@ export function SettingsCard({ t }) {
         </div>
       )}
 
-      {/* TAB 5: 积分与用量 */}
+      {/* TAB: 在线调试与实时流水 */}
+      {tab === 'playground' && (
+        <div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.15fr', gap: 12 }}>
+            <div className="wb2a-realm-card">
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                <strong style={{ fontSize: 13 }}>🧪 在线对话测试 Playground</strong>
+                {pgMetrics && <span className="wb2a-badge">{pgMetrics}</span>}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: 6, marginBottom: 8 }}>
+                <select className="wb2a-input" value={pgModel} onChange={(e) => setPgModel(e.target.value)}>
+                  {(modelsData.models || []).map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.id} [{m.rate || '-'}]
+                    </option>
+                  ))}
+                </select>
+                <select className="wb2a-input" value={pgEffort} onChange={(e) => setPgEffort(e.target.value)}>
+                  <option value="">思考档位: 默认</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                  <option value="max">max</option>
+                </select>
+              </div>
+              <textarea
+                className="wb2a-input"
+                rows={3}
+                style={{ marginBottom: 8 }}
+                value={pgPrompt}
+                onChange={(e) => setPgPrompt(e.target.value)}
+                placeholder="输入测试提示词..."
+              />
+              <button className="wb2a-btn wb2a-btn-success wb2a-btn-sm" onClick={handleRunPlayground} disabled={pgRunning} style={{ marginBottom: 8 }}>
+                {pgRunning ? '⏳ 请求执行中...' : '🚀 发送测试请求'}
+              </button>
+              <pre className="wb2a-code" style={{ minHeight: 110, maxHeight: 220 }}>{pgOutput}</pre>
+            </div>
+
+            <div className="wb2a-realm-card">
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                <strong style={{ fontSize: 13 }}>📡 在途并发 &amp; 实时请求流水</strong>
+                <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={fetchLogs}>↻ 刷新</button>
+              </div>
+              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>
+                {inFlightList.length > 0
+                  ? inFlightList.map((r) => `[${r.model} ${r.rate}] ${r.nickname}`).join(' · ')
+                  : '当前无在途请求'}
+              </div>
+              <div style={{ maxHeight: 290, overflowY: 'auto' }}>
+                {liveLogs.map((l) => (
+                  <div key={l.id} style={{ padding: '5px 0', borderBottom: '1px solid #e2e8f0', fontSize: 11 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>
+                        <strong>{l.model}</strong> <span className="wb2a-badge">{l.rate || '-'}</span>
+                      </span>
+                      <span className={`wb2a-badge ${l.status >= 400 ? 'wb2a-badge-warn' : 'wb2a-badge-success'}`}>
+                        {l.status}
+                      </span>
+                    </div>
+                    <div style={{ color: '#64748b', marginTop: 2 }}>
+                      {l.time} · {l.account} · {l.totalTokens} tok · {l.ttfbMs ? `${l.ttfbMs}ms` : `${l.durationMs}ms`}
+                      {l.tokensPerSec ? ` · ${l.tokensPerSec} t/s` : ''}
+                      {l.credit !== null && l.credit !== undefined ? ` · 扣费 -${l.credit}` : ''}
+                    </div>
+                  </div>
+                ))}
+                {liveLogs.length === 0 && (
+                  <div style={{ fontSize: 11, color: '#64748b' }}>暂无请求流水记录</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 5: 用量与实测扣费 */}
       {tab === 'usage' && (
         <div>
           <div className="wb2a-grid-stats">
             <div className="wb2a-stat-box">
-              <div className="wb2a-stat-value">{usage?.today?.requests || 0}</div>
-              <div className="wb2a-stat-label">今日请求</div>
+              <div className="wb2a-stat-value">{usage?.today?.requests || 0} / {usage?.summary?.totalRequests || 0}</div>
+              <div className="wb2a-stat-label">今日 / 历史请求</div>
             </div>
             <div className="wb2a-stat-box">
               <div className="wb2a-stat-value">{Number(usage?.today?.inputTokens || 0).toLocaleString()}</div>
@@ -937,8 +1137,8 @@ export function SettingsCard({ t }) {
               <div className="wb2a-stat-label">今日输出 Tokens</div>
             </div>
             <div className="wb2a-stat-box">
-              <div className="wb2a-stat-value">{usage?.summary?.totalRequests || 0}</div>
-              <div className="wb2a-stat-label">历史总请求</div>
+              <div className="wb2a-stat-value">{Number(usage?.summary?.totalCredit || 0).toFixed(2)}</div>
+              <div className="wb2a-stat-label">累计实测消耗积分</div>
             </div>
           </div>
 
@@ -956,6 +1156,41 @@ export function SettingsCard({ t }) {
             >
               清空账本
             </button>
+          </div>
+
+          <div style={{ fontSize: 12, color: '#475569', marginBottom: 6 }}>按模型倍率与实测扣费明细:</div>
+          <div style={{ maxHeight: 200, overflowY: 'auto', border: '1px solid #dbe5f1', borderRadius: 8, marginBottom: 12, background: '#f8fafc' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+              <thead>
+                <tr style={{ background: '#eff6ff', color: '#475569', textAlign: 'left' }}>
+                  <th style={{ padding: 6 }}>模型</th>
+                  <th style={{ padding: 6 }}>倍率</th>
+                  <th style={{ padding: 6 }}>请求</th>
+                  <th style={{ padding: 6 }}>Tokens</th>
+                  <th style={{ padding: 6 }}>命中率</th>
+                  <th style={{ padding: 6 }}>扣费</th>
+                  <th style={{ padding: 6 }}>吞吐</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(usage?.modelBreakdown || []).map((r) => (
+                  <tr key={r.model} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                    <td style={{ padding: 6 }}><strong>{r.model}</strong></td>
+                    <td style={{ padding: 6 }}><span className="wb2a-badge">{r.rate || '-'}</span></td>
+                    <td style={{ padding: 6 }}>{r.requests}</td>
+                    <td style={{ padding: 6 }}>{r.totalTokens.toLocaleString()}</td>
+                    <td style={{ padding: 6 }}>{r.cacheHitRate}%</td>
+                    <td style={{ padding: 6, color: '#2563eb', fontWeight: 700 }}>{r.credit}</td>
+                    <td style={{ padding: 6 }}>{r.tokensPerSec || 0} t/s</td>
+                  </tr>
+                ))}
+                {(!usage?.modelBreakdown || usage.modelBreakdown.length === 0) && (
+                  <tr>
+                    <td colSpan="7" style={{ padding: 10, color: '#64748b' }}>暂无分模型调用数据</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
 
           <div style={{ fontSize: 12, color: '#475569', marginBottom: 6 }}>近 7 天请求与 Token 消耗明细:</div>
@@ -1078,6 +1313,29 @@ export function SettingsCard({ t }) {
             </button>
           </div>
 
+          <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <strong style={{ fontSize: 12 }}>🔌 DeepSeek Harness (DSH) 挂载自检与同步</strong>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={fetchDshCheck}>检测</button>
+                <button
+                  className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+                  onClick={async () => {
+                    const res = await fetch('/plugins/dsh-workbuddy2api/dsh/sync', { method: 'POST' });
+                    const d = await res.json();
+                    setActionMsg(d.message || '已同步 DSH 配置');
+                    fetchDshCheck();
+                  }}
+                >
+                  同步 baseURL
+                </button>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: '#475569' }}>
+              Profile 注册: {dshInfo?.installedInProfile ? '✅ 已安装' : '⚪ 未检测'} · Patch 对齐: {dshInfo?.baseUrlMatched ? `✅ ${dshInfo.expectedBaseUrl}` : '⚠️ 未对齐'}
+            </div>
+          </div>
+
           <pre className="wb2a-code">
 {`OpenAI Chat Base URL : ${gatewayUrl}
 Anthropic Messages   : http://127.0.0.1:${port}/v1/messages
@@ -1156,6 +1414,47 @@ Web Console URL      : ${consoleUrl}`}
                 {JSON.stringify(importResult, null, 2)}
               </pre>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 账号积分包明细模态框 */}
+      {packsModalAcc && (
+        <div className="wb2a-modal-backdrop">
+          <div className="wb2a-modal" style={{ width: 600 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+              <strong>{packsModalAcc.nickname || packsModalAcc.uid} — 积分包明细</strong>
+              <button className="wb2a-btn wb2a-btn-danger wb2a-btn-sm" onClick={() => setPacksModalAcc(null)}>
+                关闭
+              </button>
+            </div>
+            <div style={{ maxHeight: 340, overflowY: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                <thead>
+                  <tr style={{ background: '#eff6ff', color: '#475569', textAlign: 'left' }}>
+                    <th style={{ padding: 6 }}>名称</th>
+                    <th style={{ padding: 6 }}>余量</th>
+                    <th style={{ padding: 6 }}>总量</th>
+                    <th style={{ padding: 6 }}>已用</th>
+                    <th style={{ padding: 6 }}>到期时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(packsModalAcc.balance?.packages || []).map((p, i) => (
+                    <tr key={i} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                      <td style={{ padding: 6 }}><strong>{p.name}</strong></td>
+                      <td style={{ padding: 6, color: '#2563eb', fontWeight: 700 }}>{p.remain}</td>
+                      <td style={{ padding: 6 }}>{p.total}</td>
+                      <td style={{ padding: 6 }}>{p.used}</td>
+                      <td style={{ padding: 6, color: '#64748b' }}>{p.expireTime || '永久'}</td>
+                    </tr>
+                  ))}
+                  {(!packsModalAcc.balance?.packages || packsModalAcc.balance.packages.length === 0) && (
+                    <tr><td colSpan="5" style={{ padding: 10, color: '#64748b' }}>暂无活跃积分包明细</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

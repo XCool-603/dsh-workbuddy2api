@@ -209,11 +209,12 @@ export function renderConsoleHtml(opts = {}) {
     </div>
     <div class="nav">
       <button class="nav-btn active" onclick="switchTab('pool')">账号池总览</button>
+      <button class="nav-btn" onclick="switchTab('models')">模型 &amp; 倍率</button>
+      <button class="nav-btn" onclick="switchTab('playground')">在线调试 &amp; 流水</button>
+      <button class="nav-btn" onclick="switchTab('usage')">用量与扣费</button>
       <button class="nav-btn" onclick="switchTab('welfare')">猫猫 &amp; 福利 &amp; 邀请</button>
       <button class="nav-btn" onclick="switchTab('tasks')">成长任务</button>
-      <button class="nav-btn" onclick="switchTab('models')">模型 &amp; 别名</button>
-      <button class="nav-btn" onclick="switchTab('usage')">用量统计</button>
-      <button class="nav-btn" onclick="switchTab('settings')">网关设置</button>
+      <button class="nav-btn" onclick="switchTab('settings')">网关与 DSH 设置</button>
     </div>
   </div>
 
@@ -299,19 +300,27 @@ export function renderConsoleHtml(opts = {}) {
       </div>
     </div>
 
-    <!-- TAB 4: MODELS -->
+    <!-- TAB 4: MODELS & RATES -->
     <div id="tab-models" class="hidden">
       <div class="toolbar">
-        <button class="btn btn-green" onclick="discoverModels()">🔍 从上游动态发现最新模型</button>
+        <button class="btn btn-green" onclick="discoverModels()">🔍 同步上游实时倍率目录</button>
         <button class="btn" onclick="saveModelsConfig()">💾 保存启用过滤与别名</button>
-        <input id="modelSearch" placeholder="过滤模型 ID..." oninput="renderModelsTable()" />
+        <select id="modelFilterMode" onchange="renderModelsTable()">
+          <option value="all">全部模型</option>
+          <option value="free">🎁 仅免费 (x0.00)</option>
+          <option value="low">💎 超低倍率 (≤0.2x)</option>
+          <option value="cn">🇨🇳 国内版 (CN)</option>
+          <option value="global">🌐 国际版 (Global)</option>
+          <option value="reasoning">🧠 支持思考</option>
+        </select>
+        <input id="modelSearch" placeholder="搜索模型 ID / 描述..." oninput="renderModelsTable()" style="min-width:180px" />
       </div>
-      <div class="grid-2">
+      <div class="grid-2" style="grid-template-columns: 1.55fr 1fr;">
         <div class="card">
-          <div class="card-title"><span>模型目录（空勾选表示全部放行）</span><span id="modelCountLabel"></span></div>
-          <div style="max-height:480px;overflow:auto">
+          <div class="card-title"><span>上游模型与实时积分倍率目录（空勾选表示全部放行）</span><span id="modelCountLabel"></span></div>
+          <div style="max-height:540px;overflow:auto">
             <table>
-              <thead><tr><th>启用</th><th>模型 ID</th><th>区服</th><th>费率</th><th>上下文</th></tr></thead>
+              <thead><tr><th>启用</th><th>模型 ID / 说明</th><th>倍率</th><th>能力 &amp; 思考档位</th><th>区服</th><th>上下文</th><th>操作</th></tr></thead>
               <tbody id="modelsTbody"></tbody>
             </table>
           </div>
@@ -319,21 +328,70 @@ export function renderConsoleHtml(opts = {}) {
         <div class="card">
           <div class="card-title"><span>模型别名映射 (JSON) &amp; auto-free 路由</span></div>
           <div class="form-field" style="margin-bottom:10px">
-            <label>auto-free 优先候选 (逗号分隔):</label>
+            <label>auto-free 智能免费路由顺序 (逗号分隔):</label>
             <input id="freeModelsInput" />
           </div>
           <div class="form-field">
-            <label>模型别名表 JSON (例: { "gpt-4o": "global:gpt-6-astra" }):</label>
-            <textarea id="aliasesTextarea" rows="16"></textarea>
+            <label>模型别名表 JSON (例: { "gpt-4o": "global:gpt-6.1-sol" }):</label>
+            <textarea id="aliasesTextarea" rows="18"></textarea>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- TAB 5: USAGE -->
+    <!-- TAB 5: PLAYGROUND & LIVE LOGS -->
+    <div id="tab-playground" class="hidden">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title"><span>🧪 在线对话测试 (Playground)</span><span id="pgStatsBadge" class="tag tag-global">就绪</span></div>
+          <div class="form-grid" style="margin-bottom:10px">
+            <div class="form-field">
+              <label>选择测试模型 (附带实时倍率):</label>
+              <select id="pgModelSelect"></select>
+            </div>
+            <div class="form-field">
+              <label>思考强度 (reasoning_effort):</label>
+              <select id="pgEffortSelect">
+                <option value="">默认</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+                <option value="max">max</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-field" style="margin-bottom:10px">
+            <label>测试提示词:</label>
+            <textarea id="pgPromptInput" rows="3" placeholder="你好，请用一句话介绍你自己"></textarea>
+          </div>
+          <div class="toolbar" style="margin-bottom:10px">
+            <label style="font-size:12px"><input type="checkbox" id="pgStreamChk" checked /> 流式 SSE 传输</label>
+            <button class="btn btn-green" onclick="runPlayground()">🚀 发送测试请求</button>
+          </div>
+          <pre class="code" id="pgOutputBox" style="min-height:140px;max-height:320px;white-space:pre-wrap">等待发送测试...</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span>📡 在途并发 &amp; 最近请求实时流水</span>
+            <button class="btn btn-sm" onclick="loadLogs()">↻ 刷新流水</button>
+          </div>
+          <div id="inFlightBox" class="sub-row" style="margin-bottom:10px">当前无在途请求</div>
+          <div style="max-height:360px;overflow:auto">
+            <table>
+              <thead><tr><th>时间</th><th>模型</th><th>倍率</th><th>账号</th><th>状态</th><th>TTFB/Tokens/速率</th><th>扣费</th></tr></thead>
+              <tbody id="logsTbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 6: USAGE & CREDIT BREAKDOWN -->
     <div id="tab-usage" class="hidden">
       <div class="toolbar">
-        <button class="btn" onclick="loadUsage()">↻ 刷新用量</button>
+        <button class="btn" onclick="loadUsage()">↻ 刷新用量与扣费</button>
         <button class="btn btn-pink" onclick="resetUsage()">清空本地用量账本</button>
       </div>
       <div class="grid-3" id="usageSummaryCards"></div>
@@ -345,6 +403,26 @@ export function renderConsoleHtml(opts = {}) {
         <div class="card">
           <div class="card-title"><span>今日 24 小时热度分布</span></div>
           <div class="bar-chart" id="chart24h"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title"><span>📊 按模型倍率、缓存命中与实测扣费排行</span></div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr>
+                <th>模型</th>
+                <th>官方倍率</th>
+                <th>请求 (成功/失败)</th>
+                <th>输入/输出 Token</th>
+                <th>缓存命中率</th>
+                <th>累计扣费</th>
+                <th>均耗 / 1k单价</th>
+                <th>均TTFB / 吞吐</th>
+              </tr>
+            </thead>
+            <tbody id="usageModelsTbody"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -395,9 +473,33 @@ export function renderConsoleHtml(opts = {}) {
         </div>
       </div>
 
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">
+          <span>🔌 DeepSeek Harness (DSH) 桌面端配置检测与一键同步</span>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-sm" onclick="checkDsh()">检测状态</button>
+            <button class="btn btn-green btn-sm" onclick="syncDsh()">一键同步 baseURL</button>
+          </div>
+        </div>
+        <div id="dshCheckBox" class="sub-row">点击「检测状态」检查本机 cordis.patch.yml 与插件挂载</div>
+      </div>
+
       <div class="card">
         <div class="card-title"><span>多协议端点接入指南</span></div>
         <pre class="code" id="guideCode"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- PACKS DETAIL MODAL -->
+  <div id="packsModal" class="modal-backdrop hidden">
+    <div class="modal" style="width:640px">
+      <div class="card-title"><span id="packsModalTitle">账号积分包明细</span><button class="btn btn-sm btn-pink" onclick="closePacksModal()">关闭</button></div>
+      <div style="max-height:420px;overflow:auto">
+        <table>
+          <thead><tr><th>积分包名称</th><th>类型</th><th>剩余</th><th>总量</th><th>已用</th><th>到期时间</th></tr></thead>
+          <tbody id="packsModalTbody"></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -458,7 +560,7 @@ export function renderConsoleHtml(opts = {}) {
     }
 
     function switchTab(tab) {
-      const tabs = ['pool', 'welfare', 'tasks', 'models', 'usage', 'settings'];
+      const tabs = ['pool', 'models', 'playground', 'usage', 'welfare', 'tasks', 'settings'];
       tabs.forEach((t, idx) => {
         document.getElementById('tab-' + t).classList.toggle('hidden', t !== tab);
         document.querySelectorAll('.nav-btn')[idx].classList.toggle('active', t === tab);
@@ -466,8 +568,9 @@ export function renderConsoleHtml(opts = {}) {
       if (tab === 'welfare') loadWelfareAndInvite();
       if (tab === 'tasks') loadTasks();
       if (tab === 'models') loadModels();
+      if (tab === 'playground') { loadModels(); loadLogs(); }
       if (tab === 'usage') loadUsage();
-      if (tab === 'settings') renderSettings();
+      if (tab === 'settings') { renderSettings(); checkDsh(); }
     }
 
     async function loadStatus(refresh = false) {
@@ -521,7 +624,7 @@ export function renderConsoleHtml(opts = {}) {
           '<td><strong>' + escapeHtml(acc.nickname || acc.uid) + '</strong>' + (isAct ? ' <span class="tag tag-cn">优先</span>' : '') + '<br><span style="color:var(--text-dim);font-size:11px">' + escapeHtml(acc.uid) + '</span></td>' +
           '<td>' + realmTag + '</td>' +
           '<td style="font-weight:700;color:var(--cyan)">' + Number(b.remain || 0).toLocaleString() + '<br><span style="color:var(--text-dim);font-size:10px">/ ' + Number(b.total || 0).toLocaleString() + '</span></td>' +
-          '<td style="font-size:11px;color:var(--text-dim)">' + pkgText + '<br>活跃包: ' + (b.activePackCount||0) + '</td>' +
+          '<td style="font-size:11px;color:var(--text-dim)">' + pkgText + '<br>活跃包: ' + (b.activePackCount||0) + ' <button class="btn btn-sm" style="padding:1px 6px;margin-left:4px" onclick="openPacksModal(\\'' + acc.uid + '\\')">明细</button></td>' +
           '<td>' + healthTag + '<br><span style="font-size:10px;color:var(--text-dim)">成功:' + (d.stats?.successCount||0) + ' 失败:' + (d.stats?.failCount||0) + '</span></td>' +
           '<td>' + (acc.inFlight || 0) + ' / ' + (d.limit || 3) + '</td>' +
           '<td style="display:flex;gap:4px;flex-wrap:wrap">' +
@@ -772,6 +875,32 @@ export function renderConsoleHtml(opts = {}) {
       loadStatus(true);
     }
 
+    function openPacksModal(uid) {
+      const acc = state.accounts.find(a => a.uid === uid);
+      if (!acc) return;
+      const packs = acc.balance?.packages || [];
+      document.getElementById('packsModalTitle').textContent = (acc.nickname || uid) + ' — 积分包明细 (' + packs.length + '个)';
+      document.getElementById('packsModalTbody').innerHTML = packs.map(p =>
+        '<tr><td>' + escapeHtml(p.name) + '</td><td>' + escapeHtml(p.type || '-') + '</td><td style="font-weight:700;color:var(--cyan)">' + (p.remain ?? 0) + '</td><td>' + (p.total ?? 0) + '</td><td>' + (p.used ?? 0) + '</td><td>' + escapeHtml(p.expireTime || '永久') + '</td></tr>'
+      ).join('') || '<tr><td colspan="6" style="color:var(--text-dim)">暂无激活积分包记录</td></tr>';
+      document.getElementById('packsModal').classList.remove('hidden');
+    }
+    function closePacksModal() {
+      document.getElementById('packsModal').classList.add('hidden');
+    }
+
+    function rateBadgeHtml(m) {
+      const rate = m?.rate || '-';
+      const mul = typeof m?.multiplier === 'number' ? m.multiplier : null;
+      let cls = 'tag-global';
+      if (m?.isFree || mul === 0) cls = 'tag-cn';
+      else if (mul !== null && mul > 1.0) cls = 'tag-warn';
+      else if (mul !== null && mul > 3.0) cls = 'tag-err';
+      const label = (m?.isFree || mul === 0) ? ('免费 ' + rate) : rate;
+      const extraBadge = m?.badge ? ' <span class="tag tag-err">' + escapeHtml(m.badge) + '</span>' : '';
+      return '<span class="tag ' + cls + '">' + escapeHtml(label) + '</span>' + extraBadge;
+    }
+
     async function loadModels() {
       const res = await api('/models');
       if (!res.ok) return;
@@ -782,22 +911,171 @@ export function renderConsoleHtml(opts = {}) {
       document.getElementById('freeModelsInput').value = state.freeModels.join(', ');
       document.getElementById('aliasesTextarea').value = JSON.stringify(state.aliases, null, 2);
       renderModelsTable();
+      const pgSel = document.getElementById('pgModelSelect');
+      if (pgSel) {
+        const cur = pgSel.value;
+        pgSel.innerHTML = state.models.map(m =>
+          '<option value="' + escapeHtml(m.id) + '">' + escapeHtml(m.id) + ' [' + escapeHtml(m.rate || '-') + ']</option>'
+        ).join('');
+        if (cur) pgSel.value = cur;
+      }
+    }
+
+    function testModelInPlayground(modelId) {
+      switchTab('playground');
+      const sel = document.getElementById('pgModelSelect');
+      if (sel) sel.value = modelId;
     }
 
     function renderModelsTable() {
       const q = (document.getElementById('modelSearch').value || '').toLowerCase();
+      const mode = (document.getElementById('modelFilterMode')?.value) || 'all';
       const enabledSet = new Set(state.enabledModels);
-      const filtered = state.models.filter(m => !q || m.id.toLowerCase().includes(q));
-      document.getElementById('modelCountLabel').textContent = '共 ' + filtered.length + ' 个模型';
-      document.getElementById('modelsTbody').innerHTML = filtered.map(m =>
-        '<tr>' +
+      const filtered = state.models.filter(m => {
+        if (q && !(m.id.toLowerCase().includes(q) || (m.name||'').toLowerCase().includes(q) || (m.description||'').toLowerCase().includes(q))) return false;
+        if (mode === 'free' && !m.isFree && m.multiplier !== 0) return false;
+        if (mode === 'low' && (m.multiplier === null || m.multiplier === undefined || m.multiplier > 0.2)) return false;
+        if (mode === 'cn' && m.realm !== 'cn') return false;
+        if (mode === 'global' && m.realm !== 'global') return false;
+        if (mode === 'reasoning' && !m.supportsReasoning && !(m.supportedEfforts && m.supportedEfforts.length)) return false;
+        return true;
+      });
+      document.getElementById('modelCountLabel').textContent = '显示 ' + filtered.length + ' / 共 ' + state.models.length + ' 个模型';
+      document.getElementById('modelsTbody').innerHTML = filtered.map(m => {
+        const caps = [];
+        if (m.supportsImages) caps.push('视觉');
+        if (m.supportsReasoning || (m.supportedEfforts && m.supportedEfforts.length)) caps.push('思考');
+        if (m.supportsToolCall) caps.push('工具');
+        const efforts = (m.supportedEfforts && m.supportedEfforts.length) ? '<br><span style="color:var(--text-dim);font-size:10px">档位: ' + m.supportedEfforts.join('/') + '</span>' : '';
+        return '<tr>' +
           '<td><input type="checkbox" class="model-chk" value="' + escapeHtml(m.id) + '" ' + (enabledSet.has(m.id) ? 'checked' : '') + ' /></td>' +
-          '<td><strong>' + escapeHtml(m.id) + '</strong>' + (m.source === 'discovered' ? ' <span class="tag tag-global">动态</span>' : '') + '</td>' +
-          '<td>' + escapeHtml(m.realm) + '</td>' +
-          '<td>' + escapeHtml(m.rate || '-') + '</td>' +
-          '<td>' + Math.round((m.contextWindow || 0) / 1000) + 'k</td>' +
+          '<td><strong>' + escapeHtml(m.id) + '</strong>' + (m.source === 'discovered' || m.source === 'upstream' ? ' <span class="tag tag-global">动态</span>' : '') + '<br><span style="color:var(--text-dim);font-size:11px">' + escapeHtml(m.description || m.name || '') + '</span></td>' +
+          '<td>' + rateBadgeHtml(m) + '</td>' +
+          '<td style="font-size:11px">' + (caps.join(' · ') || '文本') + efforts + '</td>' +
+          '<td><span class="tag ' + (m.realm === 'cn' ? 'tag-cn' : 'tag-global') + '">' + escapeHtml(m.realm) + '</span></td>' +
+          '<td>' + Math.round((m.contextWindow || 0) / 1000) + 'k / ' + Math.round((m.maxTokens || 0) / 1000) + 'k</td>' +
+          '<td><button class="btn btn-sm" onclick="testModelInPlayground(\\'' + escapeHtml(m.id) + '\\')">🧪 试跑</button></td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    async function loadLogs() {
+      const res = await api('/logs');
+      if (!res.ok) return;
+      const inFlight = res.inFlight || [];
+      document.getElementById('inFlightBox').innerHTML = inFlight.length > 0
+        ? inFlight.map(r => '<span class="tag tag-warn">[' + escapeHtml(r.model) + ' ' + escapeHtml(r.rate) + '] ' + escapeHtml(r.nickname) + ' (' + Math.round(r.elapsedMs / 1000) + 's)</span>').join(' ')
+        : '当前无在途请求（并发空闲）';
+      const logs = res.logs || [];
+      document.getElementById('logsTbody').innerHTML = logs.map(l =>
+        '<tr>' +
+          '<td>' + escapeHtml(l.time) + '</td>' +
+          '<td><strong>' + escapeHtml(l.model) + '</strong><br><span style="font-size:10px;color:var(--text-dim)">' + escapeHtml(l.protocol + '/' + l.mode) + '</span></td>' +
+          '<td><span class="tag tag-global">' + escapeHtml(l.rate || '-') + '</span></td>' +
+          '<td>' + escapeHtml(l.account || l.uid) + '</td>' +
+          '<td><span class="tag ' + (l.status >= 400 ? 'tag-err' : 'tag-cn') + '">' + l.status + '</span></td>' +
+          '<td>' + (l.ttfbMs ? l.ttfbMs + 'ms / ' : '') + l.totalTokens + ' tok' + (l.tokensPerSec ? ' / ' + l.tokensPerSec + ' t/s' : '') + '</td>' +
+          '<td>' + (l.credit !== null && l.credit !== undefined ? ('-' + l.credit) : '-') + '</td>' +
         '</tr>'
-      ).join('');
+      ).join('') || '<tr><td colspan="7" style="color:var(--text-dim)">暂无请求流水记录</td></tr>';
+    }
+
+    async function runPlayground() {
+      const model = document.getElementById('pgModelSelect').value || 'auto-free';
+      const effort = document.getElementById('pgEffortSelect').value;
+      const prompt = document.getElementById('pgPromptInput').value.trim() || '你好，请用一句话介绍你自己';
+      const stream = document.getElementById('pgStreamChk').checked;
+      const outEl = document.getElementById('pgOutputBox');
+      const badge = document.getElementById('pgStatsBadge');
+      outEl.textContent = '⏳ 正在请求 ' + model + ' ...';
+      badge.textContent = '请求中...';
+
+      const body = { model, stream, messages: [{ role: 'user', content: prompt }] };
+      if (effort) body.reasoning_effort = effort;
+      const t0 = Date.now();
+      let firstTokenMs = 0;
+
+      try {
+        const res = await fetch(API + '/playground/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          outEl.textContent = '❌ HTTP ' + res.status + ': ' + err;
+          badge.textContent = '失败 ' + res.status;
+          loadLogs();
+          return;
+        }
+        if (stream) {
+          outEl.textContent = '';
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let buf = '', acc = '', reasoning = '', usage = null;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true }).replace(/\\r\\n/g, '\\n');
+            let idx;
+            while ((idx = buf.indexOf('\\n\\n')) !== -1) {
+              const frame = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              for (const line of frame.split('\\n')) {
+                if (!line.startsWith('data:')) continue;
+                const d = line.slice(5).trim();
+                if (!d || d === '[DONE]') continue;
+                try {
+                  const p = JSON.parse(d);
+                  if (p.usage) usage = p.usage;
+                  const delta = p.choices?.[0]?.delta || {};
+                  if (delta.reasoning_content) {
+                    if (!firstTokenMs) firstTokenMs = Date.now() - t0;
+                    reasoning += delta.reasoning_content;
+                  }
+                  if (delta.content) {
+                    if (!firstTokenMs) firstTokenMs = Date.now() - t0;
+                    acc += delta.content;
+                  }
+                  outEl.textContent = (reasoning ? '[思考过程]\\n' + reasoning + '\\n\\n[回答正文]\\n' : '') + acc;
+                } catch (_) {}
+              }
+            }
+          }
+          const totalMs = Date.now() - t0;
+          const cr = usage?.credit !== undefined ? (' | 扣费 ' + usage.credit) : '';
+          badge.textContent = 'TTFB ' + (firstTokenMs || totalMs) + 'ms | 总耗时 ' + totalMs + 'ms | Tok ' + (usage?.total_tokens || '-') + cr;
+        } else {
+          const json = await res.json();
+          const msg = json.choices?.[0]?.message || {};
+          outEl.textContent = (msg.reasoning_content ? '[思考过程]\\n' + msg.reasoning_content + '\\n\\n[回答正文]\\n' : '') + (msg.content || JSON.stringify(json, null, 2));
+          const u = json.usage || {};
+          badge.textContent = '耗时 ' + (Date.now() - t0) + 'ms | Tok ' + (u.total_tokens || '-') + (u.credit !== undefined ? (' | 扣费 ' + u.credit) : '');
+        }
+        loadLogs();
+      } catch (e) {
+        outEl.textContent = '❌ 请求异常: ' + e.message;
+        badge.textContent = '异常';
+      }
+    }
+
+    async function checkDsh() {
+      const box = document.getElementById('dshCheckBox');
+      try {
+        const res = await api('/dsh/check');
+        if (!res.ok) throw new Error(res.error || '检测失败');
+        box.innerHTML = '插件安装: <span class="tag ' + (res.installedInProfile ? 'tag-cn' : 'tag-err') + '">' + (res.installedInProfile ? '已安装' : '未注册') + '</span>' +
+          ' | Patch baseURL: <span class="tag ' + (res.baseUrlMatched ? 'tag-cn' : 'tag-warn') + '">' + (res.baseUrlMatched ? '已对齐 (' + escapeHtml(res.expectedBaseUrl) + ')' : '未对齐') + '</span>' +
+          '<br>配置文件: ' + escapeHtml(res.patchPath);
+      } catch (e) {
+        box.textContent = '检测失败: ' + e.message;
+      }
+    }
+
+    async function syncDsh() {
+      const res = await api('/dsh/sync', { method: 'POST' });
+      toast(res.message || (res.ok ? '已同步' : res.error));
+      checkDsh();
     }
 
     async function discoverModels() {
@@ -831,20 +1109,34 @@ export function renderConsoleHtml(opts = {}) {
       if (!res.ok) return;
       const st = res.stats;
       document.getElementById('usageSummaryCards').innerHTML = [
-        { title: '今日请求 / 总请求', kpi: st.today.requests + ' / ' + st.summary.totalRequests, cls: '' },
-        { title: '今日输入 Tokens', kpi: st.today.inputTokens.toLocaleString(), cls: 'green' },
-        { title: '今日输出 Tokens', kpi: st.today.outputTokens.toLocaleString(), cls: 'pink' }
-      ].map(c => '<div class="card"><div class="card-title"><span>' + c.title + '</span></div><div class="kpi ' + c.cls + '">' + c.kpi + '</div></div>').join('');
+        { title: '今日请求 / 总请求', kpi: st.today.requests + ' / ' + st.summary.totalRequests, sub: '今日扣费 ' + (st.today.credit || 0) + ' 积分', cls: '' },
+        { title: '今日输入 / 输出 Tokens', kpi: (st.today.totalTokens || 0).toLocaleString(), sub: '入 ' + st.today.inputTokens.toLocaleString() + ' / 出 ' + st.today.outputTokens.toLocaleString(), cls: 'green' },
+        { title: '历史累计消耗积分', kpi: Number(st.summary.totalCredit || 0).toFixed(2), sub: '总成功 ' + (st.summary.totalSuccess || 0) + ' / 失败 ' + (st.summary.totalFailed || 0), cls: 'pink' }
+      ].map(c => '<div class="card"><div class="card-title"><span>' + c.title + '</span></div><div class="kpi ' + c.cls + '">' + c.kpi + '</div><div class="sub-row">' + (c.sub || '') + '</div></div>').join('');
 
       const max7 = Math.max(1, ...st.trend7d.map(d => d.tokens));
       document.getElementById('chart7d').innerHTML = st.trend7d.map(d =>
-        '<div class="bar-col" title="' + d.date + ': ' + d.tokens + ' tokens (' + d.requests + ' reqs)"><div class="bar-fill" style="height:' + Math.max(4, Math.round(d.tokens / max7 * 90)) + '%"></div><div class="bar-lbl">' + d.date + '</div></div>'
+        '<div class="bar-col" title="' + d.date + ': ' + d.tokens + ' tokens (' + d.requests + ' reqs, 扣费 ' + (d.credit || 0) + ')"><div class="bar-fill" style="height:' + Math.max(4, Math.round(d.tokens / max7 * 90)) + '%"></div><div class="bar-lbl">' + d.date + '</div></div>'
       ).join('');
 
       const max24 = Math.max(1, ...st.hourly.map(h => h.tokens));
       document.getElementById('chart24h').innerHTML = st.hourly.map(h =>
         '<div class="bar-col" title="' + h.hour + ': ' + h.tokens + ' tokens"><div class="bar-fill" style="height:' + Math.max(3, Math.round(h.tokens / max24 * 90)) + '%"></div><div class="bar-lbl">' + h.hour.replace('时','') + '</div></div>'
       ).join('');
+
+      const rows = st.modelBreakdown || [];
+      document.getElementById('usageModelsTbody').innerHTML = rows.map(r =>
+        '<tr>' +
+          '<td><strong>' + escapeHtml(r.model) + '</strong></td>' +
+          '<td>' + rateBadgeHtml(r) + '</td>' +
+          '<td>' + r.requests + ' <span style="color:var(--text-dim)">(' + r.success + '/' + r.failed + ')</span></td>' +
+          '<td>' + r.inputTokens.toLocaleString() + ' / ' + r.outputTokens.toLocaleString() + '</td>' +
+          '<td>' + (r.cacheHitRate || 0) + '%</td>' +
+          '<td style="font-weight:700;color:var(--cyan)">' + (r.credit || 0) + '</td>' +
+          '<td>' + (r.creditPerReq || 0) + ' / ' + (r.costPer1k || 0) + '</td>' +
+          '<td>' + (r.avgTtfbMs || 0) + 'ms / ' + (r.tokensPerSec || 0) + ' t/s</td>' +
+        '</tr>'
+      ).join('') || '<tr><td colspan="8" style="color:var(--text-dim)">尚无模型消耗统计，发起请求后将自动记录真实倍率与扣费</td></tr>';
     }
 
     async function resetUsage() {

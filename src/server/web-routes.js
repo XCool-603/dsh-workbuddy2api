@@ -2,6 +2,9 @@
  * web-routes.js - 统一管控台与内网 Web API 路由中心（同时挂载至 DSH WebServer 与 Loopback 网关）
  */
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { performCheckin } from '../upstream/checkin.js';
 import {
   getBuddyInfo,
@@ -109,6 +112,7 @@ export function registerWebRoutes(ctx, deps) {
     try {
       const bal = await client.fetchBalance(account);
       balanceCache.set(uid, { data: bal, fetchedAt: Date.now() });
+      scheduler.updateAccountCredits(uid, bal.remain, bal.expiringRemain);
       return bal;
     } catch (err) {
       if (cached) return cached.data;
@@ -193,8 +197,9 @@ export function registerWebRoutes(ctx, deps) {
           enabledModels: cfg.enabledModels || Array.from(loopback.enabledModels),
           freeModels: cfg.freeModels || [],
           discoveredModelsCount: loopback.discoveredModels?.length || 0,
+          inFlightRequests: scheduler.getInFlightRequests(),
           config: cfg,
-          stats: ledger.getStats()
+          stats: ledger.getStats(loopback.getModelCatalogMap())
         });
       }
     },
@@ -506,11 +511,92 @@ export function registerWebRoutes(ctx, deps) {
       }
     },
 
-    // 12. 用量统计与账本重置
+    // 12. 用量统计（含按模型倍率/消耗明细）、实时请求流水与账本重置
     {
       path: '/plugins/dsh-workbuddy2api/usage',
       handler: async (_req, res) => {
-        sendJson(res, 200, { ok: true, stats: ledger.getStats() });
+        sendJson(res, 200, {
+          ok: true,
+          stats: ledger.getStats(loopback.getModelCatalogMap()),
+          inFlightRequests: scheduler.getInFlightRequests()
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/logs',
+      handler: async (_req, res) => {
+        sendJson(res, 200, {
+          ok: true,
+          logs: ledger.getRecentLogs(),
+          inFlight: scheduler.getInFlightRequests()
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/playground/chat',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        if (!body || !body.messages) {
+          sendJson(res, 400, { ok: false, error: '请求体缺少 messages' });
+          return;
+        }
+        await loopback.executeChatPipeline(req, res, body, 'chat', body.model);
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/dsh/check',
+      handler: async (_req, res) => {
+        const dshHome = store.dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+        const profilePkgPath = path.join(dshHome, 'profiles', 'desktop', 'package.json');
+        const patchPath = path.join(dshHome, 'profiles', 'desktop', 'cordis.patch.yml');
+        const port = loopback.actualPort || loopback.preferredPort || 7863;
+        const expectedBaseUrl = `http://127.0.0.1:${port}/v1`;
+
+        let installedInProfile = false;
+        let baseUrlMatched = false;
+        let patchPreview = '';
+
+        try {
+          if (fs.existsSync(profilePkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(profilePkgPath, 'utf8'));
+            installedInProfile = Boolean(pkg.dependencies?.['dsh-workbuddy2api']);
+          }
+          if (fs.existsSync(patchPath)) {
+            const yml = fs.readFileSync(patchPath, 'utf8');
+            baseUrlMatched = yml.includes(expectedBaseUrl);
+            patchPreview = yml.split(/\r?\n/).slice(0, 60).join('\n');
+          }
+        } catch (_) {}
+
+        sendJson(res, 200, {
+          ok: true,
+          dshHome,
+          installedInProfile,
+          baseUrlMatched,
+          expectedBaseUrl,
+          patchPath,
+          patchPreview
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/dsh/sync',
+      handler: async (_req, res) => {
+        const dshHome = store.dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+        const patchPath = path.join(dshHome, 'profiles', 'desktop', 'cordis.patch.yml');
+        const port = loopback.actualPort || loopback.preferredPort || 7863;
+        const expectedBaseUrl = `http://127.0.0.1:${port}/v1`;
+        try {
+          let content = fs.existsSync(patchPath) ? fs.readFileSync(patchPath, 'utf8') : '';
+          if (content.includes('baseURL:')) {
+            content = content.replace(/(workbuddy:[\s\S]*?baseURL:\s*).*/, `$1${expectedBaseUrl}`);
+          }
+          fs.mkdirSync(path.dirname(patchPath), { recursive: true });
+          fs.writeFileSync(patchPath, content, 'utf8');
+          sendJson(res, 200, { ok: true, message: `已同步 baseURL -> ${expectedBaseUrl}`, expectedBaseUrl });
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: err.message });
+        }
       }
     },
     {

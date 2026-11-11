@@ -23,7 +23,7 @@ import {
   exportBackupZip
 } from '../src/pool/import-export.js';
 import { extractInviteCode, buildInviteUrl } from '../src/upstream/invite.js';
-import { ErrKind } from '../src/constants.js';
+import { ErrKind, parseCreditMultiplier } from '../src/constants.js';
 import { normalizeReasoningEffort } from '../src/upstream/efforts.js';
 import { isVideoModel } from '../src/upstream/video.js';
 import { createWorkBuddyAdapter } from '../src/adapter/pi-ai-adapter.js';
@@ -455,4 +455,69 @@ assert.strictEqual(
 assert.strictEqual(buildInviteUrl({ auth: { realm: 'global' } }, ''), '');
 console.log('   ✓ 邀请链接格式与链接解析测试通过');
 
-console.log('\n🎉 所有 17 项自动化全功能验证测试全部通过！');
+// 18. 测试真实模型倍率解析、/v1/models?bare=true、实测 credit 记账与流水记录
+console.log('18. 测试模型倍率、实测扣费记账、实时流水及快过期积分优先调度...');
+const r1 = parseCreditMultiplier('x0.05 credits');
+assert.strictEqual(r1.rate, 'x0.05');
+assert.strictEqual(r1.multiplier, 0.05);
+assert.strictEqual(r1.isFree, false);
+
+const rFree = parseCreditMultiplier('x0.00 credits', ['craft', 'badge:限时免费:#FF0000']);
+assert.strictEqual(rFree.rate, 'x0.00');
+assert.strictEqual(rFree.multiplier, 0);
+assert.strictEqual(rFree.isFree, true);
+assert.strictEqual(rFree.badge, '限时免费');
+
+const tmpHome2 = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-rate-'));
+const ledger2 = new UsageLedger({ dshHome: tmpHome2 });
+const store2 = new AccountStore({ dshHome: tmpHome2, skipDiscovery: true });
+store2.upsert({ account: { uid: 'u-normal', nickname: 'Normal' }, auth: { realm: 'global', accessToken: 't1', refreshToken: 'r1' } });
+store2.upsert({ account: { uid: 'u-exp', nickname: 'Expiring' }, auth: { realm: 'global', accessToken: 't2', refreshToken: 'r2' } });
+const schedRate = new Scheduler(store2);
+schedRate.updateAccountCredits('u-normal', 500, 0);
+schedRate.updateAccountCredits('u-exp', 500, 300);
+const pickedFirst = schedRate.pickCandidates('global')[0];
+assert.strictEqual(pickedFirst.account.uid, 'u-exp', '同余额下应优先消耗即将到期积分账号');
+
+const ssePumpCredit = createSSELinePump(null, { forwardRaw: false, heartbeatMs: 0 });
+ssePumpCredit.push('data: {"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":100,"completion_tokens":50,"credit":1.25,"prompt_cache_hit_tokens":40,"prompt_cache_miss_tokens":60}}\n\ndata: [DONE]\n\n');
+ssePumpCredit.finish();
+const uCred = ssePumpCredit.getUsage();
+assert.strictEqual(uCred.credit, 1.25);
+assert.strictEqual(uCred.hasCredit, true);
+assert.strictEqual(uCred.cacheHitTokens, 40);
+
+ledger2.record('global:gpt-6.1-sol', 100, 50, true, uCred);
+ledger2.addRequestLog({
+  model: 'global:gpt-6.1-sol',
+  rate: 'x1.33',
+  mode: 'stream',
+  status: 200,
+  uid: 'u-exp',
+  account: 'Expiring',
+  ...uCred,
+  durationMs: 250
+});
+const gwRate = new LoopbackGateway(schedRate, mockUpstreamClient, ledger2, { port: 0 });
+const pRate = await gwRate.start();
+const modBareRes = await fetch(`http://127.0.0.1:${pRate}/v1/models?bare=true`);
+const modBareJson = await modBareRes.json();
+const hasPrefixSol = modBareJson.data.find((m) => m.id === 'global:gpt-6.1-sol');
+const hasBareSol = modBareJson.data.find((m) => m.id === 'gpt-6.1-sol');
+assert.ok(hasPrefixSol && hasPrefixSol.billing_rate === 'x1.33' && hasPrefixSol.multiplier === 1.33);
+assert.ok(hasPrefixSol.description.startsWith('[x1.33 credit]'));
+assert.ok(hasBareSol, '?bare=true 必须同时透出裸模型名');
+
+const statsRes = await fetch(`http://127.0.0.1:${pRate}/v1/stats`);
+const statsJson = await statsRes.json();
+assert.strictEqual(statsJson.summary.totalCredit, 1.25);
+assert.strictEqual(statsJson.modelBreakdown[0].rate, 'x1.33');
+assert.strictEqual(statsJson.modelBreakdown[0].credit, 1.25);
+assert.strictEqual(statsJson.recentLogs.length, 1);
+
+gwRate.stop();
+schedRate.stopAutoRoutines();
+fs.rmSync(tmpHome2, { recursive: true, force: true });
+console.log('   ✓ 模型真实倍率解析、实测扣费记账、裸模型名透出与快过期优先调度全部通过');
+
+console.log('\n🎉 所有 18 项自动化全功能验证测试全部通过！');

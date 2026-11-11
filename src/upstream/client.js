@@ -9,11 +9,14 @@ import {
   GLOBAL_BASE,
   CHAT_COMPLETIONS_PATH,
   TOKEN_REFRESH_PATH,
+  ENTERPRISE_MODELS_PATH,
+  ENTERPRISE_MODELS_FALLBACK_PATH,
   CN_MODELS_PATH,
   V3_CONFIG_PATH,
   BILLING_METER_PATH_CN,
   BILLING_METER_PATH_GLOBAL,
-  ErrKind
+  ErrKind,
+  parseCreditMultiplier
 } from '../constants.js';
 import { prepareOutboundPayload } from './payload.js';
 import { prepareMessagesWithVision } from './vision.js';
@@ -375,52 +378,84 @@ export class UpstreamClient {
     const seen = new Set();
 
     const addItem = (item) => {
+      if (!item || typeof item !== 'object') return;
       const bare = item.id || item.model || item.name;
       if (!bare || item.disabled) return;
       const fullId = /^(cn:|global:)/i.test(bare) ? bare : `${prefix}${bare}`;
       if (seen.has(fullId)) return;
       seen.add(fullId);
+
+      const rateInfo = parseCreditMultiplier(item.credits || item.rate, item.tags);
+      const supportedEfforts = Array.isArray(item.reasoning?.supportedEfforts)
+        ? item.reasoning.supportedEfforts
+        : (item.reasoning?.effort ? [item.reasoning.effort] : (item.supportedEfforts || []));
+      const defaultEffort = item.reasoning?.defaultEffort || item.reasoning?.effort || '';
+
       models.push({
         id: fullId,
         bareId: bare,
         realm: isGlobal ? 'global' : 'cn',
         name: item.displayName || item.name || bare,
-        contextWindow: item.maxInputTokens || item.contextWindow || item.context_length || 200000,
-        maxTokens: item.maxOutputTokens || item.maxTokens || 32000,
-        supportsImages: Boolean(item.supportsImages ?? item.multimodal ?? true),
-        supportedEfforts: item.reasoning?.efforts || item.supportedEfforts || null,
-        rate: item.rate || '标准'
+        description: item.descriptionZh || item.descriptionEn || item.description || '',
+        credits: rateInfo.credits,
+        rate: rateInfo.rate,
+        multiplier: rateInfo.multiplier,
+        isFree: rateInfo.isFree,
+        badge: rateInfo.badge,
+        vendor: item.vendor || '',
+        tags: Array.isArray(item.tags) ? item.tags : [],
+        isDefault: Boolean(item.isDefault),
+        supportsImages: Boolean(item.supportsImages ?? item.multimodal ?? !item.disabledMultimodal),
+        supportsReasoning: Boolean(item.supportsReasoning),
+        supportsToolCall: Boolean(item.supportsToolCall ?? true),
+        onlyReasoning: Boolean(item.onlyReasoning),
+        contextWindow: Number(item.maxInputTokens || item.maxAllowedSize || item.contextWindow || item.context_length || 200000),
+        maxTokens: Number(item.maxOutputTokens || item.maxTokens || 32000),
+        supportedEfforts,
+        defaultEffort
       });
     };
 
-    // 1. 探测 /v3/config 与 /v2/models
-    for (const path of [V3_CONFIG_PATH, '/v2/models']) {
+    const probeGet = async (path) => {
+      let res = await fetch(`${base}${path}`, {
+        headers: this.buildHeaders(account, false),
+        signal: AbortSignal.timeout(10000)
+      });
+      if (res.status === 401 && account.auth?.refreshToken) {
+        try {
+          await this.refreshToken(account);
+          res = await fetch(`${base}${path}`, {
+            headers: this.buildHeaders(account, false),
+            signal: AbortSignal.timeout(10000)
+          });
+        } catch (_) {}
+      }
+      if (!res.ok) return null;
+      return await res.json().catch(() => null);
+    };
+
+    // 1. 首选官方实时倍率目录端点 (/v2/enterprises/personal/models 及 /console fallback)
+    for (const path of [ENTERPRISE_MODELS_PATH, ENTERPRISE_MODELS_FALLBACK_PATH]) {
       try {
-        const res = await fetch(`${base}${path}`, {
-          headers: this.buildHeaders(account, false),
-          signal: AbortSignal.timeout(8000)
-        });
-        if (res.ok) {
-          const json = await res.json().catch(() => ({}));
-          const list = json.data?.models || json.models || (Array.isArray(json.data) ? json.data : []);
+        const json = await probeGet(path);
+        if (json && (json.code === 0 || json.code === 200 || Array.isArray(json.data) || json.data?.models)) {
+          const list = json.data?.models || (Array.isArray(json.data) ? json.data : (json.models || []));
           for (const item of list) addItem(item);
+          if (models.length > 0) break;
         }
       } catch (_) {}
     }
 
-    // 2. 探测 CN 插件 /v2/plugin/auth/models 端点
-    if (!isGlobal || models.length === 0) {
-      try {
-        const cnRes = await fetch(`${base}${CN_MODELS_PATH}`, {
-          headers: this.buildHeaders(account, false),
-          signal: AbortSignal.timeout(8000)
-        });
-        if (cnRes.ok) {
-          const cnData = await cnRes.json().catch(() => ({}));
-          const list = Array.isArray(cnData.data) ? cnData.data : (cnData.data?.models || []);
+    // 2. 兜底探测 /v3/config、/v2/models 与 /v2/plugin/auth/models
+    if (models.length === 0) {
+      for (const path of [V3_CONFIG_PATH, '/v2/models', CN_MODELS_PATH]) {
+        try {
+          const json = await probeGet(path);
+          if (!json) continue;
+          const list = json.data?.config?.models || json.data?.models || json.models || (Array.isArray(json.data) ? json.data : []);
           for (const item of list) addItem(item);
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
     }
 
     return models;

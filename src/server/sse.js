@@ -28,19 +28,30 @@ export function extractUsageFromPayload(parsed) {
   const promptTokens = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
   const completionTokens = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
   const totalTokens = Number(u.total_tokens ?? (promptTokens + completionTokens)) || 0;
-  const cachedTokens = Number(
+  const cacheHitTokens = Number(
+    u.prompt_cache_hit_tokens ??
     u.prompt_tokens_details?.cached_tokens ??
     u.cache_read_input_tokens ??
     u.cached_tokens ??
     0
   ) || 0;
+  const cacheMissTokens = Number(u.prompt_cache_miss_tokens ?? 0) || 0;
+  const cacheWriteTokens = Number(u.prompt_cache_write_tokens ?? 0) || 0;
+  const hasCredit = typeof u.credit === 'number' && !Number.isNaN(u.credit);
+  const credit = hasCredit ? Number(u.credit) : 0;
 
   return {
     promptTokens,
     completionTokens,
     totalTokens,
-    cachedTokens,
-    cacheHit: cachedTokens > 0
+    cachedTokens: cacheHitTokens,
+    cacheHitTokens,
+    cacheMissTokens,
+    cacheWriteTokens,
+    cacheHit: cacheHitTokens > 0,
+    credit,
+    hasCredit,
+    quota: u.quota && typeof u.quota === 'object' ? u.quota : null
   };
 }
 
@@ -83,7 +94,8 @@ export function createSSELinePump(res, onEventOrOptions = {}) {
   const {
     onEvent = null,
     forwardRaw = true,
-    heartbeatMs = SSE_PING_INTERVAL_MS
+    heartbeatMs = SSE_PING_INTERVAL_MS,
+    startTime = Date.now()
   } = opts;
 
   let buffer = '';
@@ -92,9 +104,17 @@ export function createSSELinePump(res, onEventOrOptions = {}) {
   let stopped = false;
   let usagePromptTokens = 0;
   let usageCompletionTokens = 0;
+  let usageCacheHitTokens = 0;
+  let usageCacheMissTokens = 0;
+  let usageCacheWriteTokens = 0;
+  let usageCredit = 0;
+  let hasCredit = false;
+  let quota = null;
   let cacheHit = false;
   let sawContentChars = 0;
   let sawDone = false;
+  let firstDataAt = 0;
+  let lastDataAt = 0;
 
   const stopHeartbeat = res && heartbeatMs > 0
     ? startSSEHeartbeat(res, heartbeatMs, () => {
@@ -129,11 +149,23 @@ export function createSSELinePump(res, onEventOrOptions = {}) {
       } catch (_) {}
 
       if (parsed) {
+        const now = Date.now();
+        if (!firstDataAt) firstDataAt = now;
+        lastDataAt = now;
+
         const extracted = extractUsageFromPayload(parsed);
         if (extracted) {
           if (extracted.promptTokens > 0) usagePromptTokens = Math.max(usagePromptTokens, extracted.promptTokens);
           if (extracted.completionTokens > 0) usageCompletionTokens = Math.max(usageCompletionTokens, extracted.completionTokens);
+          if (extracted.cacheHitTokens > 0) usageCacheHitTokens = Math.max(usageCacheHitTokens, extracted.cacheHitTokens);
+          if (extracted.cacheMissTokens > 0) usageCacheMissTokens = Math.max(usageCacheMissTokens, extracted.cacheMissTokens);
+          if (extracted.cacheWriteTokens > 0) usageCacheWriteTokens = Math.max(usageCacheWriteTokens, extracted.cacheWriteTokens);
           if (extracted.cacheHit) cacheHit = true;
+          if (extracted.hasCredit) {
+            hasCredit = true;
+            usageCredit = Math.max(usageCredit, extracted.credit);
+          }
+          if (extracted.quota) quota = extracted.quota;
         }
         const choice0 = parsed.choices?.[0];
         const delta = choice0?.delta;
@@ -209,10 +241,24 @@ export function createSSELinePump(res, onEventOrOptions = {}) {
       const completionTokens = usageCompletionTokens > 0
         ? usageCompletionTokens
         : (sawContentChars > 0 ? Math.max(1, Math.ceil(sawContentChars / 3)) : 0);
+      const ttfbMs = firstDataAt > startTime ? (firstDataAt - startTime) : 0;
+      const genSec = lastDataAt > firstDataAt ? (lastDataAt - firstDataAt) / 1000 : 0;
+      const tokensPerSec = genSec > 0.05 && completionTokens > 0
+        ? Number((completionTokens / genSec).toFixed(1))
+        : 0;
       return {
         promptTokens: usagePromptTokens,
         completionTokens,
-        cacheHit
+        totalTokens: usagePromptTokens + completionTokens,
+        cacheHit,
+        cacheHitTokens: usageCacheHitTokens,
+        cacheMissTokens: usageCacheMissTokens,
+        cacheWriteTokens: usageCacheWriteTokens,
+        credit: usageCredit,
+        hasCredit,
+        quota,
+        ttfbMs,
+        tokensPerSec
       };
     }
   };

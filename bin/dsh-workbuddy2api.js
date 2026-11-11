@@ -81,11 +81,14 @@ async function main() {
     }
 
     case 'models': {
-      const active = store.getActive();
+      const allAccs = store.getAll().filter((a) => !a.disabled);
+      const cnAcc = allAccs.find((a) => a.auth?.realm !== 'global');
+      const glAcc = allAccs.find((a) => a.auth?.realm === 'global');
       let remoteModels = [];
-      if (active) {
+      for (const acc of [cnAcc, glAcc].filter(Boolean)) {
         try {
-          remoteModels = await client.fetchModels(active);
+          const list = await client.fetchModels(acc);
+          remoteModels.push(...list);
         } catch (_) {}
       }
 
@@ -93,13 +96,15 @@ async function main() {
       if (isJson) {
         console.log(JSON.stringify(models, null, 2));
       } else {
-        console.log(`\n=== 可用模型清单 (共 ${models.length} 个) ===`);
+        console.log(`\n=== 实时可用模型与倍率清单 (共 ${models.length} 个) ===`);
         for (const m of models) {
-          const img = m.supportsImages ? ' [多模态]' : '';
-          const rate = m.rate ? ` (${m.rate})` : '';
-          console.log(`  • ${m.id} -> ${m.name}${img}${rate}`);
+          const img = m.supportsImages ? ' [视觉]' : '';
+          const think = (m.supportsReasoning || m.supportedEfforts?.length) ? ' [思考]' : '';
+          const rate = m.rate ? ` [${m.isFree ? '免费 ' : ''}${m.rate}]` : '';
+          const badge = m.badge ? ` (${m.badge})` : '';
+          console.log(`  • ${m.id.padEnd(32)}${rate.padEnd(14)} ${m.name}${img}${think}${badge}`);
         }
-        console.log('==========================================\n');
+        console.log('=====================================================\n');
       }
       break;
     }

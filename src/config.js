@@ -22,7 +22,7 @@ export const defaultConfig = {
   proxy: '',
   enabledModels: [],
   aliases: { ...DEFAULT_MODEL_ALIASES },
-  freeModels: ['global:deepseek-v4.1-flash', 'global:glm-5.3-flash', 'cn:hy4free']
+  freeModels: ['global:hy4free', 'cn:hy4free', 'global:hy3', 'cn:hy3', 'global:deepseek-v4.1-flash-sg', 'cn:deepseek-v4.1-flash']
 };
 
 export function unwrapConfig(raw) {
