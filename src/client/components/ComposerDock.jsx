@@ -64,9 +64,8 @@ export function ComposerDock() {
         实时积分:{' '}
         <strong
           style={{
-            color: '#38bdf8',
-            fontWeight: 700,
-            textShadow: '0 0 6px rgba(56,189,248,0.3)'
+            color: '#2563eb',
+            fontWeight: 700
           }}
           title={balance?.packages?.length ? `已挂载 ${balance.packages.length} 个积分包` : ''}
         >
@@ -81,7 +80,7 @@ export function ComposerDock() {
       {activeAccount && (
         <>
           <span>·</span>
-          <span style={{ color: '#cbd5e1' }}>
+          <span style={{ color: '#334155' }}>
             {activeAccount.nickname || activeAccount.uid.slice(0, 8)} ({activeAccount.realm})
           </span>
         </>
@@ -90,7 +89,7 @@ export function ComposerDock() {
         style={{
           background: 'transparent',
           border: 'none',
-          color: loading ? '#38bdf8' : '#94a3b8',
+          color: loading ? '#2563eb' : '#64748b',
           cursor: 'pointer',
           fontSize: 12,
           padding: '0 2px',
@@ -110,12 +109,13 @@ export function ComposerDock() {
         target="_blank"
         rel="noreferrer"
         style={{
-          color: '#38bdf8',
+          color: '#2563eb',
           textDecoration: 'none',
           fontSize: 11,
+          fontWeight: 600,
           marginLeft: 2
         }}
-        title="打开独立 Cyberpunk Web 控制台"
+        title="打开独立白蓝 Web 控制台"
       >
         控制台↗
       </a>

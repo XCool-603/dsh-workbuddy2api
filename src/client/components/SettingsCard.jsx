@@ -363,12 +363,12 @@ export function SettingsCard({ t }) {
         <div
           style={{
             marginBottom: 12,
-            padding: '7px 11px',
-            borderRadius: 6,
-            background: 'rgba(56,189,248,0.1)',
-            border: '1px solid rgba(56,189,248,0.3)',
+            padding: '8px 12px',
+            borderRadius: 8,
+            background: '#eff6ff',
+            border: '1px solid #bfdbfe',
             fontSize: 12,
-            color: '#bae6fd'
+            color: '#1e40af'
           }}
         >
           {actionMsg}
@@ -399,13 +399,13 @@ export function SettingsCard({ t }) {
         <div>
           <div className="wb2a-summary-grid">
             {[
-              ['全池合计 (All)', summary.all, '#38bdf8'],
-              ['国内版 (CodeBuddy CN)', summary.cn, '#4ade80'],
-              ['国际版 (WorkBuddy AI)', summary.global, '#c084fc']
+              ['全池合计 (All)', summary.all, '#2563eb'],
+              ['国内版 (CodeBuddy CN)', summary.cn, '#059669'],
+              ['国际版 (WorkBuddy AI)', summary.global, '#0284c7']
             ].map(([title, s = {}, color]) => (
               <div key={title} className="wb2a-realm-card">
-                <div style={{ fontSize: 11, color: '#94a3b8' }}>{title}</div>
-                <div style={{ fontSize: 20, fontWeight: 700, color, margin: '4px 0' }}>
+                <div style={{ fontSize: 11, color: '#64748b' }}>{title}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, color, margin: '4px 0' }}>
                   {Number(s.remain || 0).toLocaleString()}
                 </div>
                 <div style={{ fontSize: 10, color: '#64748b' }}>
@@ -475,7 +475,7 @@ export function SettingsCard({ t }) {
                     <strong>{acc.nickname || acc.uid.slice(0, 10)}</strong>
                     <span className="wb2a-badge">{acc.realm}</span>
                     {isAct && <span className="wb2a-badge wb2a-badge-success">当前优先</span>}
-                    {acc.disabled && <span className="wb2a-badge" style={{ color: '#f87171', borderColor: '#f87171' }}>已停用</span>}
+                    {acc.disabled && <span className="wb2a-badge" style={{ color: '#dc2626', background: '#fef2f2', borderColor: '#fecaca' }}>已停用</span>}
                     {!acc.disabled && diag.coolingDown && (
                       <span className="wb2a-badge wb2a-badge-warn">熔断 {diag.cooldownRemainingSec}s</span>
                     )}
@@ -483,8 +483,8 @@ export function SettingsCard({ t }) {
                       <span className="wb2a-badge wb2a-badge-warn">{diag.modelCooldowns.length}模型冷却</span>
                     )}
                   </div>
-                  <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
-                    实时积分: <strong style={{ color: '#38bdf8' }}>{Number(bal.remain || 0).toLocaleString()}</strong> / {Number(bal.total || 0).toLocaleString()}
+                  <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
+                    实时积分: <strong style={{ color: '#2563eb' }}>{Number(bal.remain || 0).toLocaleString()}</strong> / {Number(bal.total || 0).toLocaleString()}
                     {' · '}基:{bal.baseRemain || 0} 赠:{bal.bonusRemain || 0} 购:{bal.purchasedRemain || 0}
                     {' · '}并发: {acc.inFlight || 0}/{diag.limit || 3}
                     {' · '}成功/失败: {diag.stats?.successCount || 0}/{diag.stats?.failCount || 0}
@@ -545,8 +545,8 @@ export function SettingsCard({ t }) {
             );
           })}
 
-          <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid #2a324b' }}>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 6 }}>单条凭证快速入池（支持 Access / Refresh Token 自动解析）:</div>
+          <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid #e2e8f0' }}>
+            <div style={{ fontSize: 12, color: '#475569', marginBottom: 6 }}>单条凭证快速入池（支持 Access / Refresh Token 自动解析）:</div>
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               <input
                 className="wb2a-input"
@@ -663,7 +663,7 @@ export function SettingsCard({ t }) {
                   派出旅行
                 </button>
               </div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
+              <div style={{ fontSize: 12, color: '#475569' }}>
                 宠物: {travelData?.buddy?.name || '未领养/仅CN支持'} · 状态: {travelData?.travel?.state || '-'} · 待领奖励: {travelData?.travel?.reward_credit || 0}
               </div>
             </div>
@@ -688,7 +688,7 @@ export function SettingsCard({ t }) {
                   抽一次奖
                 </button>
               </div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
+              <div style={{ fontSize: 12, color: '#475569' }}>
                 连登天数: {growthData?.streak?.streak_days ?? growthData?.streak?.days ?? '-'} · 抽奖次数: {growthData?.chances?.remaining ?? growthData?.chances?.chances ?? 0}
               </div>
             </div>
@@ -696,14 +696,14 @@ export function SettingsCard({ t }) {
 
           <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>🎁 官方专属邀请中心</div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8, lineHeight: 1.7 }}>
-              邀请码: <strong style={{ color: '#38bdf8' }}>{inviteInfo?.inviteCode || '暂未分配'}</strong>
+            <div style={{ fontSize: 12, color: '#475569', marginBottom: 8, lineHeight: 1.7 }}>
+              邀请码: <strong style={{ color: '#2563eb' }}>{inviteInfo?.inviteCode || '暂未分配'}</strong>
               {' · '}已邀请: {inviteInfo?.invitedCount || 0} 人 (有效 {inviteInfo?.validInviteCount || 0})
-              {' · '}累计奖励: <strong style={{ color: '#4ade80' }}>+{inviteInfo?.rewardCredit || 0}</strong> 积分
+              {' · '}累计奖励: <strong style={{ color: '#059669' }}>+{inviteInfo?.rewardCredit || 0}</strong> 积分
               <br />
               专属链接:{' '}
               {inviteInfo?.inviteUrl ? (
-                <a href={inviteInfo.inviteUrl} target="_blank" rel="noreferrer" style={{ color: '#4ade80' }}>
+                <a href={inviteInfo.inviteUrl} target="_blank" rel="noreferrer" style={{ color: '#2563eb', fontWeight: 500 }}>
                   {inviteInfo.inviteUrl}
                 </a>
               ) : (
@@ -823,7 +823,7 @@ export function SettingsCard({ t }) {
               );
             })}
             {tasksList.length === 0 && (
-              <div style={{ fontSize: 12, color: '#94a3b8', padding: 12 }}>当前选中账号暂无返回任务条目（成长任务主要面向 CN 国内版账号）</div>
+              <div style={{ fontSize: 12, color: '#64748b', padding: 12 }}>当前选中账号暂无返回任务条目（成长任务主要面向 CN 国内版账号）</div>
             )}
           </div>
         </div>
@@ -863,8 +863,8 @@ export function SettingsCard({ t }) {
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 12 }}>
-            <div style={{ maxHeight: 340, overflowY: 'auto', border: '1px solid #2a324b', borderRadius: 8, padding: 8 }}>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+            <div style={{ maxHeight: 340, overflowY: 'auto', border: '1px solid #dbe5f1', borderRadius: 8, padding: 8, background: '#f8fafc' }}>
+              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
                 启用模型勾选（全不勾选代表默认全部放行）:
               </div>
               {(modelsData.models || [])
@@ -877,7 +877,7 @@ export function SettingsCard({ t }) {
                       justifyContent: 'space-between',
                       alignItems: 'center',
                       padding: '5px 6px',
-                      borderBottom: '1px solid rgba(255,255,255,0.04)',
+                      borderBottom: '1px solid #e2e8f0',
                       fontSize: 12,
                       cursor: 'pointer'
                     }}
@@ -900,14 +900,14 @@ export function SettingsCard({ t }) {
             </div>
 
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>auto-free 智能免费路由顺序 (逗号分隔):</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>auto-free 智能免费路由顺序 (逗号分隔):</div>
               <input
                 className="wb2a-input"
                 style={{ marginBottom: 10 }}
                 value={freeModelsDraft}
                 onChange={(e) => setFreeModelsDraft(e.target.value)}
               />
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>客户端模型别名映射表 (JSON):</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>客户端模型别名映射表 (JSON):</div>
               <textarea
                 className="wb2a-input"
                 rows={12}
@@ -958,15 +958,15 @@ export function SettingsCard({ t }) {
             </button>
           </div>
 
-          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 6 }}>近 7 天请求与 Token 消耗明细:</div>
+          <div style={{ fontSize: 12, color: '#475569', marginBottom: 6 }}>近 7 天请求与 Token 消耗明细:</div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 }}>
             {(usage?.trend7d || []).map((d) => (
               <div key={d.date} className="wb2a-stat-box" style={{ padding: 8 }}>
                 <div style={{ fontSize: 10, color: '#64748b' }}>{d.date}</div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: '#38bdf8', margin: '3px 0' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#2563eb', margin: '3px 0' }}>
                   {d.requests} 次
                 </div>
-                <div style={{ fontSize: 10, color: '#94a3b8' }}>{Number(d.tokens || 0).toLocaleString()} tok</div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>{Number(d.tokens || 0).toLocaleString()} tok</div>
               </div>
             ))}
           </div>
@@ -978,7 +978,7 @@ export function SettingsCard({ t }) {
         <div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>网关 API Key (留空免鉴权):</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>网关 API Key (留空免鉴权):</div>
               <input
                 className="wb2a-input"
                 value={cfgDraft.apiKey || ''}
@@ -987,7 +987,7 @@ export function SettingsCard({ t }) {
               />
             </div>
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>上游 HTTP 代理 (留空直连):</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>上游 HTTP 代理 (留空直连):</div>
               <input
                 className="wb2a-input"
                 value={cfgDraft.proxy || ''}
@@ -996,7 +996,7 @@ export function SettingsCard({ t }) {
               />
             </div>
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>国内版 CN 单号最大并发:</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>国内版 CN 单号最大并发:</div>
               <input
                 type="number"
                 className="wb2a-input"
@@ -1005,7 +1005,7 @@ export function SettingsCard({ t }) {
               />
             </div>
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>国际版 Global 单号最大并发:</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>国际版 Global 单号最大并发:</div>
               <input
                 type="number"
                 className="wb2a-input"
@@ -1014,7 +1014,7 @@ export function SettingsCard({ t }) {
               />
             </div>
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>并发队列等待超时 (ms):</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>并发队列等待超时 (ms):</div>
               <input
                 type="number"
                 className="wb2a-input"
@@ -1023,7 +1023,7 @@ export function SettingsCard({ t }) {
               />
             </div>
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>System Prompt 注入模式:</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>System Prompt 注入模式:</div>
               <select
                 className="wb2a-input"
                 value={cfgDraft.promptMode || 'none'}
@@ -1037,7 +1037,7 @@ export function SettingsCard({ t }) {
           </div>
 
           <div style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>自定义 System Prompt 文本:</div>
+            <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>自定义 System Prompt 文本:</div>
             <textarea
               className="wb2a-input"
               rows={3}
@@ -1083,7 +1083,7 @@ export function SettingsCard({ t }) {
 Anthropic Messages   : http://127.0.0.1:${port}/v1/messages
 OpenAI Responses     : http://127.0.0.1:${port}/v1/responses
 Video Generations    : http://127.0.0.1:${port}/v1/videos/generations
-Cyberpunk Web Console: ${consoleUrl}`}
+Web Console URL      : ${consoleUrl}`}
           </pre>
         </div>
       )}
@@ -1104,11 +1104,11 @@ Cyberpunk Web Console: ${consoleUrl}`}
                 取消
               </button>
             </div>
-            <p style={{ fontSize: 12, color: '#94a3b8' }}>
+            <p style={{ fontSize: 12, color: '#475569' }}>
               若浏览器未自动弹出授权页面，请点击下方链接完成登录，系统正在自动轮询状态：
             </p>
             <div style={{ margin: '8px 0', wordBreak: 'break-all', fontSize: 11 }}>
-              <a href={oauthModal.url} target="_blank" rel="noreferrer" style={{ color: '#38bdf8' }}>
+              <a href={oauthModal.url} target="_blank" rel="noreferrer" style={{ color: '#2563eb', fontWeight: 500 }}>
                 {oauthModal.url}
               </a>
             </div>
@@ -1128,18 +1128,18 @@ Cyberpunk Web Console: ${consoleUrl}`}
               </button>
             </div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>默认区服:</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>默认区服:</div>
               <select className="wb2a-input" value={importRealm} onChange={(e) => setImportRealm(e.target.value)}>
                 <option value="global">国际版 (Global / workbuddy.ai)</option>
                 <option value="cn">国内版 (CN / codebuddy.cn)</option>
               </select>
             </div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>选择 .zip 备份包 / .json / .txt 文件:</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>选择 .zip 备份包 / .json / .txt 文件:</div>
               <input type="file" accept=".zip,.json,.txt,.info" onChange={handleImportFileChange} />
             </div>
             <div style={{ marginBottom: 10 }}>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>或直接粘贴文本（支持 JSON / 注释 / access----refresh）:</div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>或直接粘贴文本（支持 JSON / 注释 / access----refresh）:</div>
               <textarea
                 className="wb2a-input"
                 rows={6}
