@@ -451,7 +451,7 @@ export function registerWebRoutes(ctx, deps) {
           return;
         }
         try {
-          const info = await fetchInviteInfo(target);
+          const info = await fetchInviteInfo(target, client);
           sendJson(res, 200, { ok: true, uid, info });
         } catch (err) {
           sendJson(res, 500, { ok: false, message: err.message });
@@ -468,7 +468,7 @@ export function registerWebRoutes(ctx, deps) {
           sendJson(res, 404, { ok: false, message: '账号未找到' });
           return;
         }
-        const result = await bindInviteCode(target, body.inviteCode);
+        const result = await bindInviteCode(target, body.inviteCode, client);
         invalidateBalance(target.account.uid);
         sendJson(res, result.ok ? 200 : 400, result);
       }

@@ -335,16 +335,16 @@ async function main() {
         process.exit(1);
       }
       if (args[0] === 'bind' && args[1]) {
-        const res = await bindInviteCode(active, args[1]);
+        const res = await bindInviteCode(active, args[1], client);
         console.log(isJson ? JSON.stringify(res, null, 2) : `${res.ok ? '✅' : '❌'} ${res.message}`);
       } else {
-        const info = await fetchInviteInfo(active);
+        const info = await fetchInviteInfo(active, client);
         if (isJson) {
           console.log(JSON.stringify(info, null, 2));
         } else {
-          console.log(`\n🎁 我的邀请码: ${info.inviteCode}`);
-          console.log(`🔗 专属链接: ${info.inviteUrl}`);
-          console.log(`👥 已邀请人数: ${info.invitedCount} | 累计奖励积分: ${info.rewardCredit}\n`);
+          console.log(`\n🎁 我的邀请码: ${info.inviteCode || '暂未获取'}`);
+          console.log(`🔗 专属链接: ${info.inviteUrl || '-'}`);
+          console.log(`👥 已邀请人数: ${info.invitedCount} (有效: ${info.validInviteCount || 0}) | 累计奖励积分: ${info.rewardCredit} (上限: ${info.capValue || 30000})\n`);
         }
       }
       break;

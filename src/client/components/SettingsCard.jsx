@@ -696,15 +696,24 @@ export function SettingsCard({ t }) {
 
           <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>🎁 官方专属邀请中心</div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>
-              邀请码: <strong style={{ color: '#38bdf8' }}>{inviteInfo?.inviteCode || '-'}</strong>
-              {' · '}专属链接: <a href={inviteInfo?.inviteUrl} target="_blank" rel="noreferrer" style={{ color: '#4ade80' }}>{inviteInfo?.inviteUrl || '-'}</a>
-              {' · '}已邀请: {inviteInfo?.invitedCount || 0} 人
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8, lineHeight: 1.7 }}>
+              邀请码: <strong style={{ color: '#38bdf8' }}>{inviteInfo?.inviteCode || '暂未分配'}</strong>
+              {' · '}已邀请: {inviteInfo?.invitedCount || 0} 人 (有效 {inviteInfo?.validInviteCount || 0})
+              {' · '}累计奖励: <strong style={{ color: '#4ade80' }}>+{inviteInfo?.rewardCredit || 0}</strong> 积分
+              <br />
+              专属链接:{' '}
+              {inviteInfo?.inviteUrl ? (
+                <a href={inviteInfo.inviteUrl} target="_blank" rel="noreferrer" style={{ color: '#4ade80' }}>
+                  {inviteInfo.inviteUrl}
+                </a>
+              ) : (
+                <span>-</span>
+              )}
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
               <input
                 className="wb2a-input"
-                placeholder="输入推荐人邀请码进行受邀绑定..."
+                placeholder="粘贴推荐人邀请码或完整邀请链接进行绑定..."
                 value={bindCodeInput}
                 onChange={(e) => setBindCodeInput(e.target.value)}
               />
@@ -718,7 +727,7 @@ export function SettingsCard({ t }) {
                   });
                   const d = await res.json();
                   appendLog(`邀请绑定: ${d.message || JSON.stringify(d)}`);
-                  setActionMsg(d.message || '绑定请求已执行');
+                  setActionMsg(`${d.ok ? '✅' : '❌'} ${d.message || '绑定请求已执行'}`);
                   fetchStatus(true);
                 }}
               >

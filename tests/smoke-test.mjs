@@ -22,6 +22,7 @@ import {
   extractAccountCandidates,
   exportBackupZip
 } from '../src/pool/import-export.js';
+import { extractInviteCode, buildInviteUrl } from '../src/upstream/invite.js';
 import { ErrKind } from '../src/constants.js';
 import { normalizeReasoningEffort } from '../src/upstream/efforts.js';
 import { isVideoModel } from '../src/upstream/video.js';
@@ -438,4 +439,20 @@ sched2.stopAutoRoutines();
 fs.rmSync(tmpHome, { recursive: true, force: true });
 console.log('   ✓ Loopback + WebRoutes + Console + 多协议网关集成测试全部通过');
 
-console.log('\n🎉 所有 16 项自动化全功能验证测试全部通过！');
+// 17. 测试官方邀请码提取与 CN/Global 正确链接生成
+console.log('17. 测试官方邀请链接生成与邀请码提取...');
+assert.strictEqual(extractInviteCode('https://www.workbuddy.ai/?inviteCode=V7XSPLX4'), 'V7XSPLX4');
+assert.strictEqual(extractInviteCode('https://www.workbuddy.cn/events/invite?inviteCode=g1j8nrf8q3'), 'g1j8nrf8q3');
+assert.strictEqual(extractInviteCode('PSU2X49Y'), 'PSU2X49Y');
+assert.strictEqual(
+  buildInviteUrl({ auth: { realm: 'global' } }, 'V7XSPLX4'),
+  'https://www.workbuddy.ai/?inviteCode=V7XSPLX4'
+);
+assert.strictEqual(
+  buildInviteUrl({ auth: { realm: 'cn' } }, 'g1j8nrf8q3'),
+  'https://www.workbuddy.cn/events/invite?inviteCode=g1j8nrf8q3'
+);
+assert.strictEqual(buildInviteUrl({ auth: { realm: 'global' } }, ''), '');
+console.log('   ✓ 邀请链接格式与链接解析测试通过');
+
+console.log('\n🎉 所有 17 项自动化全功能验证测试全部通过！');

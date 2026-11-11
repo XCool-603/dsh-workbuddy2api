@@ -670,7 +670,9 @@ export function renderConsoleHtml(opts = {}) {
           ? '猫猫: ' + (tr.buddy?.name || '未领养') + ' | 状态: ' + (tr.travel?.state || '未知') + ' | 奖励: ' + (tr.travel?.reward_credit || 0)
           : (tr.message || '仅国内版支持猫猫旅行');
         document.getElementById('inviteBox').innerHTML = inv.ok
-          ? '我的邀请码: <strong style="color:var(--cyan)">' + escapeHtml(inv.info.inviteCode) + '</strong> | 链接: <a style="color:var(--emerald)" target="_blank" href="' + inv.info.inviteUrl + '">' + escapeHtml(inv.info.inviteUrl) + '</a> (已邀 ' + inv.info.invitedCount + ' 人)'
+          ? '我的邀请码: <strong style="color:var(--cyan)">' + escapeHtml(inv.info.inviteCode || '暂未分配') + '</strong> | 链接: ' +
+            (inv.info.inviteUrl ? '<a style="color:var(--emerald)" target="_blank" href="' + inv.info.inviteUrl + '">' + escapeHtml(inv.info.inviteUrl) + '</a>' : '-') +
+            ' | 已邀 ' + inv.info.invitedCount + ' 人 (有效 ' + (inv.info.validInviteCount || 0) + ') · 累计奖 ' + (inv.info.rewardCredit || 0) + ' 积分'
           : '无法获取邀请信息';
         document.getElementById('welfareLog').textContent = JSON.stringify({ streak: gr.streak, chances: gr.chances }, null, 2);
       } catch (e) {}
