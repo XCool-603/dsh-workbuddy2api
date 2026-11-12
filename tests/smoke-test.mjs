@@ -51,6 +51,7 @@ import { ModelCatalogEnricher } from '../src/upstream/model-catalog.js';
 import { createAnthropicStreamEmitter } from '../src/server/messages.js';
 import { runSchoolActivity, fetchSchoolStatus } from '../src/upstream/school.js';
 import { isCSTNightWindow, TASK_MAPPING } from '../src/upstream/tasks.js';
+import { createRequire } from 'node:module';
 import vm from 'node:vm';
 
 console.log('🧪 开始执行 WorkBuddy 2API 自动化冒烟测试...\n');
@@ -924,4 +925,101 @@ new vm.Script(sm2[1]);
 fs.rmSync(tmpHome5, { recursive: true, force: true });
 console.log('   ✓ 开学季活动/抽奖、夜猫窗口、4项扩展成长任务与 Console JS 语法测试通过');
 
-console.log('\n🎉 所有 24 项自动化全功能验证测试全部通过！');
+// 25. 测试 WorkBuddy / VS Code .vsix OPC 包结构、内置网关拉起、Webview 通信桥与侧边栏脚本
+console.log('25. 测试 WorkBuddy / VS Code .vsix 安装包、内置网关自动拉起与 Webview 通信桥...');
+const vsixPath = path.resolve('vscode-extension/workbuddy2api-gateway-1.3.0.vsix');
+assert.ok(fs.existsSync(vsixPath), '必须先生成 .vsix 扩展安装包');
+const vsixEntries = parseZipEntries(fs.readFileSync(vsixPath));
+const entryMap = new Map(vsixEntries.map((e) => [e.name, e.content]));
+for (const reqFile of ['[Content_Types].xml', 'extension.vsixmanifest', 'extension/package.json', 'extension/media/icon.png', 'extension/media/sidebar.svg', 'extension/dist/extension.js']) {
+  assert.ok(entryMap.has(reqFile), `.vsix 必须包含 OPC 文件: ${reqFile}`);
+}
+assert.ok(entryMap.get('[Content_Types].xml').toString('utf8').includes('Extension="vsixmanifest"'), '[Content_Types].xml 格式必须合法');
+assert.ok(entryMap.get('extension.vsixmanifest').toString('utf8').includes('Microsoft.VisualStudio.Code'), 'extension.vsixmanifest 必须声明 VS Code/WorkBuddy 目标');
+const pngMagic = entryMap.get('extension/media/icon.png').subarray(0, 4);
+assert.deepStrictEqual([...pngMagic], [137, 80, 78, 71], 'icon.png 必须是合法 PNG 文件');
+
+const tmpHome6 = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-vsix-'));
+const reqFn = createRequire(import.meta.url);
+let registeredViewProvider = null;
+let openedPanelHtml = '';
+let panelMsgHandler = null;
+const registeredCmds = {};
+const postedFromPanel = [];
+const mockVscode = {
+  ViewColumn: { One: 1 },
+  StatusBarAlignment: { Right: 2 },
+  Uri: { parse: (s) => ({ toString: () => s }), file: (s) => ({ fsPath: s }) },
+  workspace: {
+    getConfiguration: () => ({
+      get: (k, d) => (k === 'port' ? 0 : k === 'dshHome' ? tmpHome6 : d)
+    })
+  },
+  env: { openExternal: () => {}, clipboard: { writeText: async () => {} } },
+  window: {
+    createOutputChannel: () => ({ appendLine: () => {}, dispose: () => {} }),
+    createStatusBarItem: () => ({ show: () => {}, dispose: () => {}, text: '', tooltip: '', command: '' }),
+    registerWebviewViewProvider: (_id, prov) => { registeredViewProvider = prov; return { dispose: () => {} }; },
+    createWebviewPanel: (_id, _t) => ({
+      reveal: () => {},
+      onDidDispose: () => {},
+      webview: {
+        get html() { return openedPanelHtml; },
+        set html(v) { openedPanelHtml = v; },
+        onDidReceiveMessage: (fn) => { panelMsgHandler = fn; return { dispose: () => {} }; },
+        postMessage: (m) => { postedFromPanel.push(m); }
+      }
+    }),
+    showInformationMessage: async () => {},
+    showWarningMessage: async () => '确定',
+    showInputBox: async () => '100',
+    showErrorMessage: async (m) => { throw new Error('Unexpected extension error: ' + m); }
+  },
+  commands: {
+    registerCommand: (id, fn) => { registeredCmds[id] = fn; return { dispose: () => {} }; },
+    executeCommand: (id, ...args) => registeredCmds[id]?.(...args)
+  }
+};
+const extCode = entryMap.get('extension/dist/extension.js').toString('utf8');
+const extMod = { exports: {} };
+const extRunner = new vm.Script(`(function(require, module, exports){ ${extCode} })`).runInThisContext();
+extRunner((id) => (id === 'vscode' ? mockVscode : reqFn(id)), extMod, extMod.exports);
+const mockExtCtx = { subscriptions: [] };
+try {
+  await extMod.exports.activate(mockExtCtx);
+  assert.ok(registeredViewProvider && registeredCmds['workbuddy2api.openConsole'], '扩展激活后必须注册侧边栏 View 与全部命令');
+
+  // 验证侧边栏 Webview HTML 及脚本语法
+  let sidebarHtml = '';
+  registeredViewProvider.resolveWebviewView({
+    webview: { options: {}, onDidReceiveMessage: () => ({ dispose: () => {} }), postMessage: () => {}, set html(v) { sidebarHtml = v; }, get html() { return sidebarHtml; } },
+    onDidDispose: () => {}
+  });
+  assert.ok(sidebarHtml.includes('WorkBuddy 2API') && sidebarHtml.includes('acquireVsCodeApi'), '侧边栏 HTML 必须包含 Webview 通信桥');
+  for (const sm of sidebarHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+    new vm.Script(sm[1]);
+  }
+
+  // 验证全功能控制台面板 HTML 及通过 Webview 通信桥调用 /public/status API
+  await registeredCmds['workbuddy2api.openConsole']();
+  assert.ok(openedPanelHtml.includes('__WB2A_API_ORIGIN__') && openedPanelHtml.includes('aliasesVisualList'), '全功能控制台 Webview 应完整渲染并注入通信桥');
+  for (const sm of openedPanelHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+    new vm.Script(sm[1]);
+  }
+  assert.ok(typeof panelMsgHandler === 'function');
+  await panelMsgHandler({ type: 'wb2a:fetch', reqId: 't-1', path: '/plugins/dsh-workbuddy2api/public/status', method: 'GET', headers: {} });
+  for (let i = 0; i < 30; i++) {
+    if (postedFromPanel.some((m) => m.type === 'wb2a:fetch-end' && m.reqId === 't-1')) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const startMsg = postedFromPanel.find((m) => m.type === 'wb2a:fetch-start' && m.reqId === 't-1');
+  const bodyChunks = postedFromPanel.filter((m) => m.type === 'wb2a:fetch-chunk' && m.reqId === 't-1').map((m) => Buffer.from(m.b64, 'base64'));
+  const parsedPub = JSON.parse(Buffer.concat(bodyChunks).toString('utf8'));
+  assert.ok(startMsg && startMsg.status === 200 && parsedPub.ok === true, 'Webview 通信桥应成功代理 /public/status HTTP 请求并返回合法 JSON');
+} finally {
+  extMod.exports.deactivate();
+  fs.rmSync(tmpHome6, { recursive: true, force: true });
+}
+console.log('   ✓ WorkBuddy / VS Code .vsix OPC 打包、扩展激活、侧边栏与控制台 Webview 通信桥全部通过');
+
+console.log('\n🎉 所有 25 项自动化全功能验证测试全部通过！');

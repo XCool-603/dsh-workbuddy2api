@@ -36,6 +36,7 @@ import {
   fetchSchoolStatus,
   runSchoolActivity
 } from '../src/upstream/school.js';
+import { createGatewayRuntime } from '../src/runtime.js';
 import { STATIC_MODELS } from '../src/constants.js';
 
 const [,, cmd, ...args] = process.argv;
@@ -454,6 +455,30 @@ async function main() {
       break;
     }
 
+    case 'serve': {
+      const pIdx = args.indexOf('--port');
+      const reqPort = pIdx !== -1 && args[pIdx + 1] ? Number(args[pIdx + 1]) : undefined;
+      const rt = createGatewayRuntime({
+        port: Number.isFinite(reqPort) ? reqPort : undefined,
+        skipInitialWelfare: args.includes('--no-initial-checkin')
+      });
+      const boundPort = await rt.start();
+      console.log(`✅ WorkBuddy 2API 独立网关已启动:`);
+      console.log(`   • Web 控制台 : http://127.0.0.1:${boundPort}/console`);
+      console.log(`   • OpenAI Base : http://127.0.0.1:${boundPort}/v1`);
+      console.log(`   • Anthropic   : http://127.0.0.1:${boundPort}`);
+      console.log(`   • 按 Ctrl+C 停止服务`);
+      await new Promise((resolve) => {
+        const shutdown = () => {
+          rt.stop();
+          resolve();
+        };
+        process.once('SIGINT', shutdown);
+        process.once('SIGTERM', shutdown);
+      });
+      break;
+    }
+
     case 'doctor': {
       console.log('\n=== WorkBuddy 2API 环境诊断 ===');
       console.log(`Node.js 版本: ${process.version}`);
@@ -475,6 +500,7 @@ DSH WorkBuddy 2API CLI 命令行工具
   dsh plugin exec dsh-workbuddy2api <command> [options]
 
 可用命令:
+  serve [--port 7863]  🚀 脱离 DSH 独立常驻运行多协议网关与白蓝控制台
   status [--json]      查看账号池运行状态与当前主号余额
   health               探测运行中网关 /healthz 与双域可用性
   models [--json]      向上游拉取当前账号真实可用模型清单与倍率

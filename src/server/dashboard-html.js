@@ -227,7 +227,7 @@ export function renderConsoleHtml(opts = {}) {
       <button class="nav-btn" onclick="switchTab('welfare')">猫猫 &amp; 福利 &amp; 邀请</button>
       <button class="nav-btn" onclick="switchTab('tasks')">成长任务</button>
       <button class="nav-btn" onclick="switchTab('settings')">安全 · 告警 · 用户 · DSH</button>
-      <a class="btn btn-sm" href="/portal" target="_blank">门户 ↗</a>
+      <a class="btn btn-sm" href="#" onclick="openExternalUrl(getApiOrigin() + '/portal');return false;">门户 ↗</a>
       <button id="logoutBtn" class="btn btn-sm btn-pink hidden" onclick="doLogout()">退出</button>
     </div>
   </div>
@@ -763,7 +763,20 @@ export function renderConsoleHtml(opts = {}) {
   <div id="toast" class="toast hidden"></div>
 
   <script>
-    const API = '/plugins/dsh-workbuddy2api';
+    const API = (window.__WB2A_API_ORIGIN__ || '') + '/plugins/dsh-workbuddy2api';
+    function getApiOrigin() { return window.__WB2A_API_ORIGIN__ || window.location.origin; }
+    function openExternalUrl(url) {
+      if (typeof window.__wb2aOpenExternal === 'function') window.__wb2aOpenExternal(url);
+      else window.open(url, '_blank');
+    }
+    async function askConfirm(msg) {
+      if (typeof window.__wb2aConfirm === 'function') return window.__wb2aConfirm(msg);
+      return window.confirm(msg);
+    }
+    async function askPrompt(msg, defVal) {
+      if (typeof window.__wb2aPrompt === 'function') return window.__wb2aPrompt(msg, defVal);
+      return window.prompt(msg, defVal);
+    }
     let state = { accounts: [], activeUid: null, summary: {}, models: [], aliases: {}, modelRoutes: {}, autoFreeEnabled: true, freeModels: [], config: {}, runtimeNetwork: {}, auth: {} };
     let oauthPollTimer = null;
     let pgAttachment = null; // { kind: 'image' | 'text', name, data }
@@ -932,7 +945,7 @@ export function renderConsoleHtml(opts = {}) {
     }
 
     async function switchAcc(uid) { await api('/accounts/switch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) }); toast('已切换优先账号'); loadStatus(); }
-    async function deleteAcc(uid) { if (!confirm('确认删除 ' + uid + ' 吗？')) return; await api('/accounts/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) }); toast('已删除'); loadStatus(); }
+    async function deleteAcc(uid) { if (!(await askConfirm('确认删除 ' + uid + ' 吗？'))) return; await api('/accounts/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) }); toast('已删除'); loadStatus(); }
     async function adminAction(uid, action) {
       toast('执行 ' + action + ' ...');
       const res = await api('/accounts/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, action }) });
@@ -1033,7 +1046,7 @@ export function renderConsoleHtml(opts = {}) {
       document.getElementById('oauthTitle').textContent = (realm === 'global' ? '国际版 WorkBuddy AI' : '国内版 CodeBuddy') + ' OAuth 登录';
       document.getElementById('oauthLink').href = res.url; document.getElementById('oauthLink').textContent = res.url;
       document.getElementById('oauthModal').classList.remove('hidden');
-      window.open(res.url, '_blank');
+      openExternalUrl(res.url);
       if (oauthPollTimer) clearInterval(oauthPollTimer);
       oauthPollTimer = setInterval(async () => {
         const poll = await api('/oauth/poll', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ realm, state: res.state }) });
@@ -1093,7 +1106,10 @@ export function renderConsoleHtml(opts = {}) {
       box.classList.remove('hidden');
       toast('导入完成: 新增 ' + (res.imported || 0) + ' / 更新 ' + (res.updated || 0) + ' / 失败 ' + (res.failed || 0)); loadStatus(true);
     }
-    function exportZip() { window.location.href = API + '/accounts/export.zip'; }
+    function exportZip() {
+      if (typeof window.__wb2aExportZip === 'function') window.__wb2aExportZip();
+      else window.location.href = API + '/accounts/export.zip';
+    }
 
     function setWelfareResult(summary, badgeText, badgeCls, rowsHtml) {
       const b = document.getElementById('welfareSummaryBadge');
@@ -1620,9 +1636,14 @@ export function renderConsoleHtml(opts = {}) {
         '<tr><td><strong>' + escapeHtml(r.model) + '</strong></td><td>' + rateBadgeHtml(r) + '</td><td>' + r.requests + ' (' + r.success + '/' + r.failed + ')</td><td>' + r.inputTokens.toLocaleString() + ' / ' + r.outputTokens.toLocaleString() + '</td><td>' + (r.cacheHitRate || 0) + '%</td><td style="font-weight:700;color:var(--cyan)">' + (r.credit || 0) + '</td><td>' + (r.creditPerReq || 0) + ' / ' + (r.costPer1k || 0) + '</td><td>' + (r.avgTtfbMs || 0) + 'ms / ' + (r.tokensPerSec || 0) + ' t/s</td></tr>'
       ).join('') || '<tr><td colspan="8">尚无模型消耗记录</td></tr>';
     }
-    async function resetUsage() { if (!confirm('确认清空全部统计账本吗？')) return; await api('/stats/reset', { method: 'POST' }); toast('已清空'); loadUsage(); }
+    async function resetUsage() { if (!(await askConfirm('确认清空全部统计账本吗？'))) return; await api('/stats/reset', { method: 'POST' }); toast('已清空'); loadUsage(); }
 
     function copyText(text, label) {
+      if (typeof window.__wb2aCopyText === 'function') {
+        window.__wb2aCopyText(text, label);
+        toast('已复制 ' + label);
+        return;
+      }
       if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast('已复制 ' + label)).catch(() => {});
     }
     let _guideCopyList = [];
@@ -1693,7 +1714,7 @@ export function renderConsoleHtml(opts = {}) {
       const evSet = new Set(al.events || ['ban','401','cooling','low_credit']);
       document.querySelectorAll('.alert-evt').forEach(el => { el.checked = evSet.has(el.value); });
 
-      renderGuideCards(window.location.origin);
+      renderGuideCards(getApiOrigin());
     }
 
     async function saveConfig() {
@@ -1799,10 +1820,10 @@ export function renderConsoleHtml(opts = {}) {
     }
     async function adminToggleUser(username, disabled) { await api('/admin/users/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, disabled }) }); loadAdminUsers(); }
     async function adminResetKey(username) { await api('/admin/users/reset_key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) }); toast('Key 已重置'); loadAdminUsers(); }
-    async function adminDeleteUser(username) { if (!confirm('删除用户 ' + username + ' ?')) return; await api('/admin/users/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) }); loadAdminUsers(); }
+    async function adminDeleteUser(username) { if (!(await askConfirm('删除用户 ' + username + ' ?'))) return; await api('/admin/users/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) }); loadAdminUsers(); }
     async function adminSetQuota(username) {
-      const q = prompt('输入每日积分上限 (0 表示不限):', '100'); if (q === null) return;
-      const r = prompt('输入每分钟请求 RPM 上限 (0 表示不限):', '30'); if (r === null) return;
+      const q = await askPrompt('输入每日积分上限 (0 表示不限):', '100'); if (q === null) return;
+      const r = await askPrompt('输入每分钟请求 RPM 上限 (0 表示不限):', '30'); if (r === null) return;
       await api('/admin/users/quota', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, dailyCreditLimit: Number(q), rpm: Number(r) }) });
       loadAdminUsers();
     }

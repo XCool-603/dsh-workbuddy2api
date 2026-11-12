@@ -37,6 +37,8 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "build:vsix": "node vscode-extension/build-vsix.mjs",
+    "build:all": "node build.mjs && node vscode-extension/build-vsix.mjs",
     "watch": "node build.mjs --watch",
     "test": "node tests/smoke-test.mjs"
   },
