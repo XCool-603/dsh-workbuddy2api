@@ -901,12 +901,22 @@ assert.strictEqual(schoolRes.ok, true);
 assert.strictEqual(schoolRes.creditGained, 66);
 assert.strictEqual(schoolRes.prizes.length, 1);
 
-// 注册包含 /school/* 的 web-routes 与 Console HTML 语法检查
+// 注册包含 /school/* 与扩展交互路由的 web-routes 与 Console HTML 语法检查
 const reg6 = registerWebRoutes({}, { scheduler: sched5Reloaded, client: new UpstreamClient(), ledger: new UsageLedger({ filePath: path.join(tmpHome5, 'l2.json') }), loopback: gw5, configStore: cfg5 });
-assert.ok(reg6.routes.some((r) => r.path === '/plugins/dsh-workbuddy2api/school/status'));
-assert.ok(reg6.routes.some((r) => r.path === '/plugins/dsh-workbuddy2api/school/run'));
+for (const p of ['/plugins/dsh-workbuddy2api/school/status', '/plugins/dsh-workbuddy2api/school/run', '/plugins/dsh-workbuddy2api/travel/adopt', '/plugins/dsh-workbuddy2api/travel/run', '/plugins/dsh-workbuddy2api/growth/redeem', '/plugins/dsh-workbuddy2api/growth/makeup', '/plugins/dsh-workbuddy2api/growth/gift', '/plugins/dsh-workbuddy2api/tasks/nightcat']) {
+  assert.ok(reg6.routes.some((r) => r.path === p), `应注册扩展控制台路由: ${p}`);
+}
 const htmlW2 = renderConsoleHtml({ port: p5 });
-assert.ok(htmlW2.includes('schSchool') && htmlW2.includes('schCat') && htmlW2.includes('runSchoolActivity'));
+assert.ok(
+  htmlW2.includes('schSchool') &&
+  htmlW2.includes('addTokenModal') &&
+  htmlW2.includes('aliasesVisualList') &&
+  htmlW2.includes('streakVisualBox') &&
+  htmlW2.includes('schoolVisualBox') &&
+  !htmlW2.includes('id="welfareLog"') &&
+  !htmlW2.includes('id="schoolLog"'),
+  'Console HTML 应采用结构化可视面板而非裸 JSON 输出框'
+);
 const sm2 = htmlW2.match(/<script>([\s\S]*?)<\/script>/);
 assert.ok(sm2 && sm2[1], 'Console HTML 必须包含完整脚本');
 new vm.Script(sm2[1]);

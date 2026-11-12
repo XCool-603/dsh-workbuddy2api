@@ -161,7 +161,7 @@ export function renderPortalHtml(opts = {}) {
     </div>
     <div class="card">
       <div class="card-title"><span>API 快速接入</span></div>
-      <pre class="code" id="portalGuide"></pre>
+      <div id="portalGuide" class="grid-2" style="margin-bottom:0"></div>
     </div>
   </div>
   <script>
@@ -188,8 +188,12 @@ export function renderPortalHtml(opts = {}) {
         return '<tr><td><strong>' + esc(m.id) + '</strong></td><td><span class="tag ' + (m.is_free ? 'tag-cn' : 'tag-global') + '">' + esc(m.billing_rate || m.credits || '-') + '</span></td><td>' + esc(m.realm || 'auto') + '</td><td>' + Math.round((m.context_length || 200000) / 1000) + 'k</td><td>' + (caps.join(' · ') || '文本') + '</td></tr>';
       }).join('');
       const base = location.origin;
-      document.getElementById('portalGuide').textContent =
-        'OpenAI Base URL  : ' + base + '/v1\\nAnthropic Base   : ' + base + '\\nResponses API    : ' + base + '/v1/responses\\nHealthz Endpoint : ' + base + '/healthz';
+      document.getElementById('portalGuide').innerHTML = [
+        { t: 'OpenAI Chat 端点', u: base + '/v1', d: '适用 Cline / Cherry Studio / Roo Code' },
+        { t: 'Claude Code (Anthropic)', u: base, d: '设置 ANTHROPIC_BASE_URL=' + base },
+        { t: 'OpenAI Responses (Codex)', u: base + '/v1/responses', d: '兼容 Codex CLI 原生交互' },
+        { t: '网关健康探针', u: base + '/healthz', d: '视频生成接口: ' + base + '/v1/videos/generations' }
+      ].map(g => '<div style="border:1px solid #dbe5f1;border-radius:8px;padding:10px;background:#f8fafc"><div style="font-weight:600;font-size:12px;color:#1e3a8a">' + g.t + '</div><div style="font-family:Consolas,monospace;font-size:11px;color:#2563eb;margin:4px 0">' + esc(g.u) + '</div><div style="font-size:11px;color:#64748b">' + esc(g.d) + '</div></div>').join('');
     }
     loadPublic();
   </script>
@@ -236,6 +240,7 @@ export function renderConsoleHtml(opts = {}) {
       <div class="toolbar">
         <button class="btn btn-green" onclick="startOAuth('cn')">+ 国内版 OAuth</button>
         <button class="btn" onclick="startOAuth('global')">+ 国际版 OAuth</button>
+        <button class="btn" onclick="openAddTokenModal()">+ 粘贴 Token 添加</button>
         <button class="btn" onclick="openImportModal()">批量 / ZIP 导入</button>
         <button class="btn" onclick="exportZip()">导出 ZIP 备份</button>
         <button class="btn btn-green" onclick="batchCheckin()">全池每日签到</button>
@@ -298,19 +303,46 @@ export function renderConsoleHtml(opts = {}) {
           </div>
         </div>
         <div class="card">
-          <div class="card-title"><span>auto-free 优先级 / 故障转移路由组 / 模型别名</span></div>
+          <div class="card-title">
+            <span>auto-free 优先级 / 故障转移路由 / 模型别名</span>
+            <button class="btn btn-sm" onclick="addClaudePresetAliases()">+ Claude Code 常用映射</button>
+          </div>
           <div class="form-field" style="margin-bottom:10px">
             <label>auto-free 智能免费路由顺序 (逗号分隔):</label>
             <input id="freeModelsInput" />
           </div>
-          <div class="form-field" style="margin-bottom:10px">
-            <label>自定义模型故障转移组 modelRoutes (JSON):</label>
-            <textarea id="modelRoutesTextarea" rows="5" placeholder='{"fast":["cn:deepseek-v4.1-flash","global:glm-4.7-flash"]}'></textarea>
+
+          <div style="border-top:1px solid #edf2f7;padding-top:10px;margin-bottom:10px">
+            <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px">故障转移路由组 (如 fast ➔ 主模型 → 备选模型)</div>
+            <div id="routesVisualList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <input id="newRouteName" placeholder="组名如 fast" style="width:110px" />
+              <input id="newRouteTargets" placeholder="候选模型逗号分隔如 cn:deepseek-v4.1-flash, global:hy4free" style="flex:1;min-width:160px" />
+              <button class="btn btn-sm btn-green" onclick="addVisualRoute()">+ 添加路由组</button>
+            </div>
           </div>
-          <div class="form-field">
-            <label>模型别名表 aliases (JSON):</label>
-            <textarea id="aliasesTextarea" rows="10"></textarea>
+
+          <div style="border-top:1px solid #edf2f7;padding-top:10px;margin-bottom:10px">
+            <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px">客户端模型别名映射 (收到左侧名称自动转发到右侧真实模型)</div>
+            <div id="aliasesVisualList" style="display:flex;flex-direction:column;gap:6px;max-height:210px;overflow-y:auto;margin-bottom:8px"></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <input id="newAliasFrom" placeholder="客户端请求名如 claude-sonnet-4-6" style="flex:1;min-width:130px" />
+              <input id="newAliasTo" placeholder="映射到真实模型如 global:gpt-6.1-sol" style="flex:1;min-width:130px" />
+              <button class="btn btn-sm btn-green" onclick="addVisualAlias()">+ 添加别名</button>
+            </div>
           </div>
+
+          <details style="font-size:11px;color:var(--text-dim)">
+            <summary style="cursor:pointer;user-select:none">高级 JSON 原文视图 (自动同步)</summary>
+            <div class="form-field" style="margin-top:8px">
+              <label>modelRoutes JSON:</label>
+              <textarea id="modelRoutesTextarea" rows="4" oninput="syncVisualFromJson()"></textarea>
+            </div>
+            <div class="form-field" style="margin-top:6px">
+              <label>aliases JSON:</label>
+              <textarea id="aliasesTextarea" rows="5" oninput="syncVisualFromJson()"></textarea>
+            </div>
+          </details>
         </div>
       </div>
     </div>
@@ -412,28 +444,58 @@ export function renderConsoleHtml(opts = {}) {
     <div id="tab-welfare" class="hidden">
       <div class="toolbar">
         <select id="welfareUidSelect" onchange="loadWelfareAndInvite()"></select>
-        <button class="btn btn-green" onclick="batchClaimAll()">全号一键吃满福利</button>
-        <button class="btn" onclick="batchRunTravel()">全号巡检猫猫旅行</button>
-        <button class="btn btn-amber" onclick="singleCheckin()">当前号每日签到</button>
-        <button class="btn" onclick="drawLottery()">连登抽奖</button>
+        <button class="btn btn-green" onclick="batchClaimAll()">🎁 全号一键吃满福利</button>
+        <button class="btn" onclick="batchRunTravel()">🐱 全号巡检猫猫旅行</button>
+        <button class="btn btn-amber" onclick="singleCheckin()">📅 当前号每日签到</button>
+        <button class="btn" onclick="claimGiftAndComp()">🎉 领新手礼/补偿</button>
+        <button class="btn" onclick="drawLottery()">🎰 连登抽一次</button>
       </div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-title"><span>🐱 猫猫旅行管家</span><button class="btn btn-sm" onclick="departTravel()">派出旅行</button></div>
-          <div id="travelBox" class="sub-row">选择国内版账号查看猫猫状态...</div>
+          <div class="card-title">
+            <span>🐱 猫猫旅行管家</span>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn btn-sm btn-green hidden" id="btnAdoptCat" onclick="adoptCat()">+ 领养小猫(+300分)</button>
+              <button class="btn btn-sm btn-amber hidden" id="btnClaimCat" onclick="claimCatReward()">🎁 领取到站奖励</button>
+              <button class="btn btn-sm" onclick="runSingleTravel()">⚡ 单号自动跑</button>
+            </div>
+          </div>
+          <div id="travelVisualBox" style="font-size:12px;line-height:1.7;margin-bottom:10px">选择国内版账号查看猫猫状态...</div>
+          <div style="display:flex;gap:6px;align-items:center;border-top:1px solid #edf2f7;padding-top:10px">
+            <label style="font-size:11px;color:#475569">目的地:</label>
+            <select id="travelLocSelect" style="flex:1">
+              <option value="4">地点 4 · 古镇客栈 (推荐)</option>
+              <option value="1">地点 1 · 森林营地</option>
+              <option value="2">地点 2 · 海滨灯塔</option>
+              <option value="3">地点 3 · 雪山木屋</option>
+            </select>
+            <button class="btn btn-sm" onclick="departTravel()">派出旅行</button>
+          </div>
         </div>
         <div class="card">
-          <div class="card-title"><span>🎁 专属邀请与受邀绑定 (v2)</span><button class="btn btn-sm" onclick="loadWelfareAndInvite()">刷新</button></div>
-          <div id="inviteBox" class="sub-row" style="margin-bottom:10px">加载中...</div>
+          <div class="card-title">
+            <span>🎁 专属邀请与受邀绑定 (v2)</span>
+            <button class="btn btn-sm" onclick="loadWelfareAndInvite()">↻ 刷新</button>
+          </div>
+          <div id="inviteBox" style="font-size:12px;line-height:1.8;margin-bottom:10px">加载中...</div>
           <div style="display:flex;gap:8px;margin-top:8px">
-            <input id="bindInviteInput" placeholder="输入推荐人邀请码绑定领积分" style="flex:1" />
+            <input id="bindInviteInput" placeholder="输入推荐人邀请码或完整邀请链接绑定" style="flex:1" />
             <button class="btn btn-green btn-sm" onclick="bindInvite()">立即绑定</button>
           </div>
         </div>
       </div>
+
       <div class="card">
-        <div class="card-title"><span>连登活动 &amp; 最近执行日志</span></div>
-        <pre class="code" id="welfareLog">等待操作...</pre>
+        <div class="card-title">
+          <span>🔥 连登里程碑 · 补签卡 · 抽奖次数</span>
+          <button class="btn btn-sm" onclick="runMakeupCard()">🩹 检查并用补签卡</button>
+        </div>
+        <div id="streakVisualBox" style="font-size:12px">加载中...</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span>📋 操作执行结果明细</span><span id="welfareSummaryBadge" class="tag tag-global">就绪</span></div>
+        <div id="welfareResultBox" style="font-size:12px;color:var(--text-dim)">点击上方任意操作按钮后，将在此展示清晰的结果汇总与各账号明细。</div>
       </div>
     </div>
 
@@ -441,15 +503,22 @@ export function renderConsoleHtml(opts = {}) {
     <div id="tab-tasks" class="hidden">
       <div class="toolbar">
         <select id="tasksUidSelect" onchange="loadTasks()"></select>
-        <button class="btn btn-green" onclick="runTasks(false)">一键全自动点亮并收割</button>
-        <button class="btn btn-amber" onclick="runTasks(true)">全量国内号一键自动化任务</button>
-        <button class="btn btn-primary" onclick="runSchoolActivity(false)">🏫 开学季活动+抽奖 (单号)</button>
-        <button class="btn" onclick="runSchoolActivity(true)">🎓 全号开学季抽奖</button>
-        <button class="btn" onclick="loadTasks()">↻ 刷新任务列表</button>
+        <button class="btn btn-green" onclick="runTasks(false)">⚡ 一键点亮并收割成长任务</button>
+        <button class="btn btn-amber" onclick="runTasks(true)">🌐 全号自动成长任务</button>
+        <button class="btn" onclick="runSchoolActivity(false)">🏫 开学季任务+转盘(单号)</button>
+        <button class="btn btn-green" onclick="runSchoolActivity(true)">🎓 全号开学季抽奖</button>
+        <button class="btn" onclick="runNightCat()">🦉 深夜猫猫(23-08点)</button>
+        <button class="btn" onclick="loadTasks()">↻ 刷新任务</button>
       </div>
-      <pre class="code hidden" id="schoolLog" style="margin-bottom:10px"></pre>
       <div class="card">
-        <div class="card-title"><span>全自动成长积分任务清单 (18+ 项)</span><span id="tasksSummary"></span></div>
+        <div class="card-title">
+          <span>🎓 开学季活动 (school_open_day_2026) &amp; 大转盘抽奖</span>
+          <span id="schoolStatusBadge" class="tag tag-global">检测中...</span>
+        </div>
+        <div id="schoolVisualBox" style="font-size:12px;color:var(--text-dim)">选择国内版账号后自动显示开学季任务进度、大转盘次数及抽奖收获。</div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span>📋 全自动成长积分任务清单 (支持进/领奖状态实时核对)</span><span id="tasksSummary"></span></div>
         <div id="tasksList"></div>
       </div>
     </div>
@@ -590,8 +659,8 @@ export function renderConsoleHtml(opts = {}) {
       </div>
 
       <div class="card">
-        <div class="card-title"><span>多协议端点接入指南</span></div>
-        <pre class="code" id="guideCode"></pre>
+        <div class="card-title"><span>🔌 其他 IDE / CLI 一键接入指南 (Claude Code · Codex · Cursor · Cline)</span></div>
+        <div id="guideCardsGrid" class="grid-2" style="margin-bottom:0"></div>
       </div>
     </div>
   </div>
@@ -631,6 +700,29 @@ export function renderConsoleHtml(opts = {}) {
     </div>
   </div>
 
+  <div id="addTokenModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="card-title"><span>+ 粘贴 Token 添加单个账号</span><button class="btn btn-sm btn-pink" onclick="closeModal('addTokenModal')">关闭</button></div>
+      <div class="form-grid" style="margin-bottom:10px">
+        <div class="form-field">
+          <label>账号区服:</label>
+          <select id="addTokenRealm"><option value="global">国际版 (Global / workbuddy.ai)</option><option value="cn">国内版 (CN / codebuddy.cn)</option></select>
+        </div>
+        <div class="form-field">
+          <label>备注昵称 (可选):</label>
+          <input id="addTokenNick" placeholder="如：主力测试号" />
+        </div>
+      </div>
+      <div class="form-field" style="margin-bottom:12px">
+        <label>粘贴 Refresh Token 或 Access Token:</label>
+        <textarea id="addTokenValue" rows="4" placeholder="支持自动识别 JWT UID，优先填 Refresh Token 可长期自动保活"></textarea>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px">
+        <button class="btn btn-green" onclick="submitAddToken()">🚀 验证连通并入池</button>
+      </div>
+    </div>
+  </div>
+
   <div id="importModal" class="modal-backdrop hidden">
     <div class="modal">
       <div class="card-title"><span>批量导入账号 (ZIP / JSON / token----refreshToken)</span><button class="btn btn-sm btn-pink" onclick="closeModal('importModal')">关闭</button></div>
@@ -641,7 +733,7 @@ export function renderConsoleHtml(opts = {}) {
       <div class="form-field" style="margin-bottom:10px"><label>上传 .zip / .json / .txt 文件:</label><input type="file" id="importFileInput" accept=".zip,.json,.txt,.info" /></div>
       <div class="form-field" style="margin-bottom:12px"><label>或直接粘贴文本:</label><textarea id="importTextarea" rows="7" placeholder="accessToken----refreshToken 或 JSON"></textarea></div>
       <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn btn-green" onclick="submitImport()">🚀 验证连通并导入</button></div>
-      <pre class="code hidden" id="importResultBox" style="margin-top:10px"></pre>
+      <div id="importResultBox" class="hidden" style="margin-top:12px"></div>
     </div>
   </div>
 
@@ -953,6 +1045,23 @@ export function renderConsoleHtml(opts = {}) {
     }
     function closeOAuthModal() { if (oauthPollTimer) clearInterval(oauthPollTimer); oauthPollTimer = null; closeModal('oauthModal'); }
     function openImportModal() { document.getElementById('importResultBox').classList.add('hidden'); document.getElementById('importModal').classList.remove('hidden'); }
+    function openAddTokenModal() {
+      document.getElementById('addTokenValue').value = '';
+      document.getElementById('addTokenNick').value = '';
+      document.getElementById('addTokenModal').classList.remove('hidden');
+    }
+    async function submitAddToken() {
+      const token = document.getElementById('addTokenValue').value.trim();
+      const nickname = document.getElementById('addTokenNick').value.trim();
+      const realm = document.getElementById('addTokenRealm').value || 'global';
+      if (!token) return toast('请先粘贴 Access 或 Refresh Token');
+      toast('正在验证账号连通性并入池...');
+      const res = await api('/accounts/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, realm, nickname }) });
+      if (!res.ok) return toast('❌ 添加失败: ' + (res.error || '未知错误'));
+      closeModal('addTokenModal');
+      toast('✅ 已添加账号: ' + (res.account?.account?.nickname || '新账号'));
+      loadStatus(true);
+    }
     async function submitImport() {
       const realm = document.getElementById('importRealm').value;
       const fileEl = document.getElementById('importFileInput');
@@ -963,10 +1072,67 @@ export function renderConsoleHtml(opts = {}) {
         payload = { defaultRealm: realm, base64Zip: btoa(bin) };
       }
       const res = await api('/accounts/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      const box = document.getElementById('importResultBox'); box.textContent = JSON.stringify(res, null, 2); box.classList.remove('hidden');
-      toast('导入完成: 新增 ' + res.imported + ' / 更新 ' + res.updated + ' / 失败 ' + res.failed); loadStatus(true);
+      const box = document.getElementById('importResultBox');
+      const items = res.details || res.results || res.items || [];
+      const rowsHtml = items.slice(0, 30).map(it =>
+        '<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #e2e8f0;font-size:11px">' +
+          '<span><strong>' + escapeHtml(it.nickname || it.uid || '未命名') + '</strong> · ' + escapeHtml(it.realm || realm) + '</span>' +
+          '<span class="tag ' + (it.ok !== false ? 'tag-cn' : 'tag-err') + '">' + escapeHtml(it.status || (it.ok !== false ? '成功' : (it.error || '失败'))) + '</span>' +
+        '</div>'
+      ).join('');
+      box.innerHTML =
+        '<div style="padding:10px;border-radius:8px;background:#f8fafc;border:1px solid #dbe5f1">' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:' + (rowsHtml ? '8px' : '0') + '">' +
+            '<span class="tag tag-cn">✅ 新增 ' + (res.imported || 0) + ' 个</span>' +
+            '<span class="tag tag-global">🔄 更新 ' + (res.updated || 0) + ' 个</span>' +
+            '<span class="tag ' + ((res.failed || 0) > 0 ? 'tag-err' : 'tag-cn') + '">❌ 失败 ' + (res.failed || 0) + ' 个</span>' +
+            (res.error ? '<span style="font-size:11px;color:var(--magenta)">' + escapeHtml(res.error) + '</span>' : (!res.total ? '<span style="font-size:11px;color:var(--amber)">未识别到有效账号，请检查粘贴格式</span>' : '')) +
+          '</div>' +
+          rowsHtml +
+        '</div>';
+      box.classList.remove('hidden');
+      toast('导入完成: 新增 ' + (res.imported || 0) + ' / 更新 ' + (res.updated || 0) + ' / 失败 ' + (res.failed || 0)); loadStatus(true);
     }
     function exportZip() { window.location.href = API + '/accounts/export.zip'; }
+
+    function setWelfareResult(summary, badgeText, badgeCls, rowsHtml) {
+      const b = document.getElementById('welfareSummaryBadge');
+      if (b) { b.textContent = badgeText || '完成'; b.className = 'tag ' + (badgeCls || 'tag-cn'); }
+      const box = document.getElementById('welfareResultBox');
+      if (box) {
+        box.innerHTML = '<div style="font-weight:600;color:#0f172a;margin-bottom:8px">' + escapeHtml(summary) + '</div>' + (rowsHtml || '');
+      }
+    }
+
+    function renderBatchAccountTable(items, mode) {
+      if (!Array.isArray(items) || items.length === 0) return '<div class="sub-row">本次暂无符合条件的国内版或可用账号。</div>';
+      return '<div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>状态</th><th>结果详情</th><th>收益</th></tr></thead><tbody>' +
+        items.map(it => {
+          let detail = it.message || it.summary || it.status || '-';
+          let gain = '-';
+          let ok = it.ok !== false && it.status !== 'error' && it.status !== 'adopt_failed';
+          if (mode === 'travel') {
+            const acts = it.results?.actions || [];
+            detail = acts.length ? acts.map(a => a.message || a.action).join('；') : (it.detail || it.reason || it.status || '已完成');
+            const c = acts.reduce((acc, a) => acc + Number(a.rewardCredit || 0), 0);
+            if (c > 0) gain = '+' + c + ' 积分';
+          } else if (mode === 'welfare') {
+            const c = Number(it.totalCreditsGained || 0);
+            if (c > 0) gain = '+' + c + ' 积分';
+            const steps = Array.isArray(it.log) ? it.log.filter(l => l.ok && l.message).slice(0, 3).map(l => l.message).join(' · ') : '';
+            if (steps) detail = steps;
+          } else if (mode === 'school') {
+            const c = Number(it.creditGained || 0);
+            if (c > 0) gain = '+' + c + ' 积分';
+            detail = it.summary || it.message || it.error || '已完成';
+          }
+          return '<tr><td><strong>' + escapeHtml(it.nickname || it.uid || '-') + '</strong></td>' +
+            '<td><span class="tag ' + (ok ? 'tag-cn' : 'tag-warn') + '">' + (ok ? '成功' : '跳过/异常') + '</span></td>' +
+            '<td>' + escapeHtml(detail) + '</td>' +
+            '<td style="font-weight:700;color:var(--emerald)">' + escapeHtml(gain) + '</td></tr>';
+        }).join('') +
+      '</tbody></table></div>';
+    }
 
     async function loadWelfareAndInvite() {
       const uid = document.getElementById('welfareUidSelect').value || state.activeUid; if (!uid) return;
@@ -975,38 +1141,225 @@ export function renderConsoleHtml(opts = {}) {
         api('/growth/status?uid=' + encodeURIComponent(uid)),
         api('/invite/info?uid=' + encodeURIComponent(uid))
       ]);
-      document.getElementById('travelBox').textContent = tr.ok ? '猫猫: ' + (tr.buddy?.name || '未领养') + ' | 状态: ' + (tr.travel?.state || '未知') + ' | 奖励: ' + (tr.travel?.reward_credit || 0) : (tr.message || '仅国内版支持猫猫旅行');
-      document.getElementById('inviteBox').innerHTML = inv.ok ? '邀请码: <strong style="color:var(--cyan)">' + escapeHtml(inv.info.inviteCode || '暂未分配') + '</strong> | 链接: ' + (inv.info.inviteUrl ? '<a style="color:var(--emerald)" target="_blank" href="' + inv.info.inviteUrl + '">' + escapeHtml(inv.info.inviteUrl) + '</a>' : '-') + ' | 已邀 ' + inv.info.invitedCount + ' 人 · 奖 ' + (inv.info.rewardCredit || 0) : '无法获取邀请信息';
-      document.getElementById('welfareLog').textContent = JSON.stringify({ streak: gr.streak, chances: gr.chances }, null, 2);
+      const trBox = document.getElementById('travelVisualBox');
+      const btnAdopt = document.getElementById('btnAdoptCat');
+      const btnClaim = document.getElementById('btnClaimCat');
+      if (!tr.ok || tr.travel?.isGlobal) {
+        btnAdopt.classList.add('hidden'); btnClaim.classList.add('hidden');
+        trBox.innerHTML = '<span class="tag tag-global">国际版无猫猫体系</span> <span style="color:var(--text-dim)">' + escapeHtml(tr.travel?.message || tr.message || '请切换 CN 国内版账号') + '</span>';
+      } else {
+        const buddy = tr.buddy;
+        const ts = tr.travel || {};
+        btnAdopt.classList.toggle('hidden', Boolean(buddy));
+        btnClaim.classList.toggle('hidden', ts.state !== 'arrived');
+        const stMap = { idle: '空闲待派出', traveling: '旅行探索中', arrived: '🎉 已到站可领奖', unsupported: '不支持', error: '查询异常' };
+        const stCls = ts.state === 'arrived' ? 'tag-cn' : ts.state === 'traveling' ? 'tag-global' : 'tag-warn';
+        trBox.innerHTML =
+          '<div><strong>宠物档案:</strong> ' + (buddy ? ('<span class="tag tag-cn">' + escapeHtml(buddy.name) + '</span>') : '<span class="tag tag-warn">尚未领养（点右上角领养送 300 分）</span>') + '</div>' +
+          '<div style="margin-top:4px"><strong>旅行状态:</strong> <span class="tag ' + stCls + '">' + escapeHtml(stMap[ts.state] || ts.state || '未知') + '</span>' +
+          ' · 待领奖励: <strong style="color:var(--emerald)">+' + (ts.rewardCredit || 0) + ' 积分</strong>' +
+          (ts.dailyLimitReached ? ' · <span class="tag tag-err">今日次数已达上限</span>' : '') + '</div>';
+      }
+
+      document.getElementById('inviteBox').innerHTML = inv.ok
+        ? '<div><strong>专属邀请码:</strong> <span style="color:var(--cyan);font-weight:700;font-size:14px">' + escapeHtml(inv.info.inviteCode || '暂未分配') + '</span></div>' +
+          '<div><strong>邀请战绩:</strong> 已邀 <strong>' + (inv.info.invitedCount || 0) + '</strong> 人 (有效 ' + (inv.info.validInviteCount || 0) + ') · 累计获奖 <strong style="color:var(--emerald)">+' + (inv.info.rewardCredit || 0) + '</strong> / ' + (inv.info.capValue || 30000) + ' 积分</div>' +
+          '<div><strong>邀请链接:</strong> ' + (inv.info.inviteUrl ? '<a style="color:var(--cyan)" target="_blank" href="' + escapeHtml(inv.info.inviteUrl) + '">' + escapeHtml(inv.info.inviteUrl) + '</a>' : '-') + '</div>'
+        : '<span style="color:var(--text-dim)">无法获取邀请信息</span>';
+
+      const sk = gr.streak || {};
+      const cards = sk.makeupCards?.balance || 0;
+      const chances = typeof gr.chances === 'number' ? gr.chances : (gr.chancesRemaining || 0);
+      const tiers = gr.tiers || [];
+      const tierHtml = tiers.map(t => {
+        const av = t.status === 'available';
+        const cl = t.status === 'claimed';
+        return '<div style="border:1px solid #dbe5f1;border-radius:8px;padding:8px 12px;background:#f8fafc;display:flex;align-items:center;gap:10px">' +
+          '<div><strong>' + escapeHtml(t.label) + '</strong><br><span style="font-size:11px;color:var(--text-dim)">' + (cl ? '✅ 已兑换' : av ? '🌟 可领取' : '⏳ 未解锁') + '</span></div>' +
+          (av ? '<button class="btn btn-sm btn-green" onclick="redeemTier(\\'' + t.tier + '\\')">立即兑换</button>' : '') +
+        '</div>';
+      }).join('');
+      document.getElementById('streakVisualBox').innerHTML =
+        '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px">' +
+          '<span><strong>当前连登:</strong> <span class="tag tag-cn">' + (sk.days || 0) + ' 天</span></span>' +
+          '<span><strong>补签卡余额:</strong> <span class="tag tag-global">' + cards + ' / ' + (sk.makeupCards?.max || 3) + ' 张</span></span>' +
+          '<span><strong>剩余抽奖次数:</strong> <span class="tag ' + (chances > 0 ? 'tag-warn' : 'tag-global') + '">' + chances + ' 次</span></span>' +
+        '</div>' +
+        '<div style="display:flex;gap:10px;flex-wrap:wrap">' + tierHtml + '</div>';
     }
-    async function departTravel() { const uid = document.getElementById('welfareUidSelect').value || state.activeUid; const res = await api('/travel/depart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) }); document.getElementById('welfareLog').textContent = JSON.stringify(res, null, 2); loadWelfareAndInvite(); }
-    async function batchRunTravel() { const res = await api('/travel/run-all', { method: 'POST' }); document.getElementById('welfareLog').textContent = JSON.stringify(res, null, 2); toast('巡检完成'); loadStatus(true); }
-    async function batchClaimAll() { const res = await api('/growth/claim-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true }) }); document.getElementById('welfareLog').textContent = JSON.stringify(res, null, 2); toast('全号福利完成'); loadStatus(true); }
-    async function singleCheckin() { const uid = document.getElementById('welfareUidSelect').value || state.activeUid; const res = await api('/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) }); document.getElementById('welfareLog').textContent = JSON.stringify(res, null, 2); toast(res.message || '签到完成'); loadStatus(true); }
-    async function drawLottery() { const uid = document.getElementById('welfareUidSelect').value || state.activeUid; const res = await api('/growth/lottery/draw', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) }); document.getElementById('welfareLog').textContent = JSON.stringify(res, null, 2); loadWelfareAndInvite(); }
-    async function bindInvite() { const uid = document.getElementById('welfareUidSelect').value || state.activeUid; const inviteCode = document.getElementById('bindInviteInput').value.trim(); const res = await api('/invite/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, inviteCode }) }); toast(res.message || '完成'); document.getElementById('welfareLog').textContent = JSON.stringify(res, null, 2); }
+
+    async function adoptCat() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      toast('正在领养第一只 AI 小猫...');
+      const res = await api('/travel/adopt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) });
+      setWelfareResult(res.message || (res.ok ? '领养成功 +300 积分' : '领养未完成'), res.ok ? '领养成功' : '提示', res.ok ? 'tag-cn' : 'tag-warn', '');
+      loadWelfareAndInvite(); loadStatus(true);
+    }
+    async function claimCatReward() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const tr = await api('/travel/status?uid=' + encodeURIComponent(uid));
+      const recordId = tr.travel?.recordId || 0;
+      const res = await api('/travel/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, recordId }) });
+      setWelfareResult(res.message || '旅行奖励检查完成', res.ok ? '领奖成功' : '提示', res.ok ? 'tag-cn' : 'tag-warn', '');
+      loadWelfareAndInvite(); loadStatus(true);
+    }
+    async function runSingleTravel() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      toast('正在自动巡检当前账号猫猫...');
+      const res = await api('/travel/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) });
+      setWelfareResult(res.summary || '巡检完成', res.ok ? '完成' : '跳过', res.ok ? 'tag-cn' : 'tag-warn', '');
+      loadWelfareAndInvite(); loadStatus(true);
+    }
+    async function departTravel() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const locationId = Number(document.getElementById('travelLocSelect').value || 4);
+      const res = await api('/travel/depart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, locationId }) });
+      setWelfareResult(res.message || '派出指令已提交', res.ok ? '已派出' : '提示', res.ok ? 'tag-cn' : 'tag-warn', '');
+      loadWelfareAndInvite();
+    }
+    async function batchRunTravel() {
+      toast('正在全号巡检猫猫旅行...');
+      const res = await api('/travel/run-all', { method: 'POST' });
+      setWelfareResult(res.message || '全池猫猫巡检完成', '全池巡检', 'tag-cn', renderBatchAccountTable(res.results, 'travel'));
+      toast('巡检完成'); loadStatus(true);
+    }
+    async function batchClaimAll() {
+      toast('正在为所有账号自动领满全套福利...');
+      const res = await api('/growth/claim-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true }) });
+      setWelfareResult(res.message || '全号福利领取完成', '全号完成', 'tag-cn', renderBatchAccountTable(res.results, 'welfare'));
+      toast('全号福利完成'); loadStatus(true);
+    }
+    async function singleCheckin() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const res = await api('/checkin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) });
+      setWelfareResult(res.message || '签到完成', res.ok ? '签到成功' : '已签/跳过', res.ok ? 'tag-cn' : 'tag-warn', '');
+      toast(res.message || '完成'); loadStatus(true);
+    }
+    async function claimGiftAndComp() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const res = await api('/growth/gift', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) });
+      const rows = (res.items || []).map(it =>
+        '<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #e2e8f0"><span><strong>' + escapeHtml(it.name) + '</strong>: ' + escapeHtml(it.message || '-') + '</span><span class="tag ' + (it.ok ? 'tag-cn' : 'tag-warn') + '">' + (it.credit ? '+' + it.credit + '分' : (it.ok ? '成功' : '已领/无')) + '</span></div>'
+      ).join('');
+      setWelfareResult(res.message || '礼包检查完成', '礼包/活跃', 'tag-cn', rows);
+      loadStatus(true);
+    }
+    async function redeemTier(tier) {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const res = await api('/growth/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, tier }) });
+      setWelfareResult(res.message || '兑换完成', res.ok ? '已兑换' : '提示', res.ok ? 'tag-cn' : 'tag-warn', '');
+      loadWelfareAndInvite(); loadStatus(true);
+    }
+    async function runMakeupCard() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const res = await api('/growth/makeup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) });
+      setWelfareResult(res.message || '补签检查完成', res.ok ? '已补签' : '无需补签', res.ok ? 'tag-cn' : 'tag-global', '');
+      loadWelfareAndInvite();
+    }
+    async function drawLottery() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const res = await api('/growth/lottery/draw', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid }) });
+      const r = res.result || {};
+      setWelfareResult(r.message || (r.ok ? '抽奖成功' : '暂无可用抽奖次数'), r.ok ? '🎉 中奖' : '提示', r.ok ? 'tag-cn' : 'tag-warn', '');
+      loadWelfareAndInvite(); loadStatus(true);
+    }
+    async function bindInvite() {
+      const uid = document.getElementById('welfareUidSelect').value || state.activeUid;
+      const inviteCode = document.getElementById('bindInviteInput').value.trim();
+      const res = await api('/invite/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, inviteCode }) });
+      toast(res.message || '完成');
+      setWelfareResult(res.message || '邀请绑定处理完毕', res.ok ? '绑定成功' : '绑定失败', res.ok ? 'tag-cn' : 'tag-err', '');
+    }
+
+    async function loadSchoolStatus(uid) {
+      const badge = document.getElementById('schoolStatusBadge');
+      const box = document.getElementById('schoolVisualBox');
+      if (!badge || !box) return;
+      const res = await api('/school/status?uid=' + encodeURIComponent(uid));
+      const st = res.status || {};
+      if (st.skipped) {
+        badge.textContent = '仅国内版支持'; badge.className = 'tag tag-global';
+        box.textContent = '当前选中账号为国际版 (Global)，开学季活动与抽奖仅支持中国区账号。';
+        return;
+      }
+      if (!st.ok) {
+        badge.textContent = '拉取失败'; badge.className = 'tag tag-err';
+        box.textContent = st.error || '查询开学季活动失败';
+        return;
+      }
+      if (!st.inPeriod) {
+        badge.textContent = '当前未在活动期'; badge.className = 'tag tag-warn';
+        box.textContent = '当前账号开学季活动窗口暂未开启 (in_period=false)。';
+        return;
+      }
+      badge.textContent = '活动进行中 · 抽奖余额 ' + (st.chance?.balance || 0) + ' 次';
+      badge.className = 'tag tag-cn';
+      const ts = st.tasks || [];
+      box.innerHTML = ts.map(t => {
+        const done = t.status === 'claimed' || t.status === 'completed';
+        return '<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #edf2f7">' +
+          '<span><strong>' + escapeHtml(t.title || t.task_code) + '</strong> <span style="color:var(--text-dim)">(' + (t.progress || 0) + '/' + (t.target_count || 1) + ')</span></span>' +
+          '<span class="tag ' + (done ? 'tag-cn' : 'tag-warn') + '">' + escapeHtml(t.status || 'pending') + '</span></div>';
+      }).join('') || '活动进行中，可直接点击上方「开学季任务+转盘」执行打卡与抽奖。';
+    }
 
     async function loadTasks() {
       const uid = document.getElementById('tasksUidSelect').value || state.activeUid; if (!uid) return;
+      loadSchoolStatus(uid);
       const res = await api('/tasks/list?uid=' + encodeURIComponent(uid));
       const listEl = document.getElementById('tasksList');
       if (!res.ok) { listEl.innerHTML = '<div style="color:var(--magenta)">' + escapeHtml(res.message || '加载失败') + '</div>'; return; }
       const items = res.tasks || [];
-      document.getElementById('tasksSummary').textContent = '共 ' + items.length + ' 项任务';
-      listEl.innerHTML = items.map(t => '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e2e8f0;font-size:12px"><div><strong>' + escapeHtml(t.name || t.title || t.code) + '</strong> <span style="color:var(--text-dim)">(' + escapeHtml(t.code || '') + ')</span></div><div><span class="tag ' + (t.claimed ? 'tag-cn' : t.completed ? 'tag-warn' : 'tag-err') + '">' + (t.claimed ? '已领奖' : t.completed ? '待领取' : '待触发') + '</span></div></div>').join('') || '<div class="sub-row">当前账号暂无可查询成长任务</div>';
+      const claimedCnt = items.filter(t => t.accept_status === 'claimed').length;
+      document.getElementById('tasksSummary').textContent = '共 ' + items.length + ' 项 (已领奖 ' + claimedCnt + ' 项)';
+      listEl.innerHTML = items.map(t => {
+        const st = t.accept_status || 'pending';
+        const cur = t.progress?.current ?? 0;
+        const tgt = t.progress?.target ?? 1;
+        const rew = t.reward_credit ? ('+' + t.reward_credit + ' 分') : '';
+        const stLabel = st === 'claimed' ? '✅ 已领奖' : st === 'completed' ? '🌟 可领取' : st === 'accepted' ? '⏳ 进行中' : '⚪ 待触发';
+        const stCls = st === 'claimed' ? 'tag-cn' : st === 'completed' ? 'tag-warn' : st === 'accepted' ? 'tag-global' : 'tag-err';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #e2e8f0;font-size:12px">' +
+          '<div><strong>' + escapeHtml(t.title || t.task_code || '未命名任务') + '</strong> <span style="color:var(--text-dim)">(' + escapeHtml(t.task_code || '-') + ')</span>' +
+          (rew ? ' <span class="tag tag-global">' + rew + '</span>' : '') + '</div>' +
+          '<div style="display:flex;gap:8px;align-items:center"><span style="color:var(--text-dim);font-size:11px">进度 ' + cur + '/' + tgt + '</span><span class="tag ' + stCls + '">' + stLabel + '</span></div></div>';
+      }).join('') || '<div class="sub-row">当前账号暂无可查询成长任务（成长任务仅面向国内版账号）</div>';
     }
-    async function runTasks(all) { const uid = document.getElementById('tasksUidSelect').value || state.activeUid; toast('正在执行成长任务...'); await api('/tasks/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, all }) }); toast('任务完成'); loadTasks(); loadStatus(true); }
+
+    async function runTasks(all) {
+      const uid = document.getElementById('tasksUidSelect').value || state.activeUid;
+      toast('正在自动点亮与收割成长任务...');
+      const res = await api('/tasks/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, all }) });
+      if (all) toast('全池成长任务已完成 (' + (res.results?.length || 0) + ' 个国内号)');
+      else toast(res.result?.summary || '成长任务执行完成');
+      loadTasks(); loadStatus(true);
+    }
+
     async function runSchoolActivity(all) {
       const uid = document.getElementById('tasksUidSelect').value || state.activeUid;
       toast(all ? '正在全池巡检开学季活动与转盘抽奖...' : '正在执行单号开学季活动与转盘抽奖...');
       const res = await api('/school/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, all }) });
-      const logEl = document.getElementById('schoolLog');
-      if (logEl) {
-        logEl.classList.remove('hidden');
-        logEl.textContent = JSON.stringify(res, null, 2);
+      const badge = document.getElementById('schoolStatusBadge');
+      const box = document.getElementById('schoolVisualBox');
+      if (all) {
+        badge.textContent = '全池已完成'; badge.className = 'tag tag-cn';
+        box.innerHTML = renderBatchAccountTable(res.results, 'school');
+      } else {
+        const r = res.result || {};
+        badge.textContent = r.inPeriod === false ? '未在活动期' : ('+' + (r.creditGained || 0) + ' 积分');
+        badge.className = 'tag ' + (r.ok ? 'tag-cn' : 'tag-err');
+        const prizeTags = (r.prizes || []).map(p => '<span class="tag tag-cn">🎁 ' + escapeHtml(p.label || p.prizeCode) + (p.credit ? ' (+' + p.credit + ')' : '') + '</span>').join(' ');
+        box.innerHTML = '<div style="font-weight:600;color:#0f172a;margin-bottom:6px">' + escapeHtml(r.summary || r.message || r.error || '执行完毕') + '</div>' + (prizeTags ? '<div>本轮转盘奖品: ' + prizeTags + '</div>' : '');
       }
       toast('开学季活动与抽奖完成');
       loadStatus(true);
+    }
+
+    async function runNightCat() {
+      toast('正在检查并运行深夜猫猫任务...');
+      const res = await api('/tasks/nightcat', { method: 'POST' });
+      toast(res.message || '完成');
+      if (res.ok) loadTasks();
     }
 
     function rateBadgeHtml(m) {
@@ -1021,6 +1374,76 @@ export function renderConsoleHtml(opts = {}) {
       return '<span class="tag ' + cls + '">' + escapeHtml(label) + '</span>' + extraBadge;
     }
 
+    function renderVisualRoutesAndAliases() {
+      const rList = document.getElementById('routesVisualList');
+      const aList = document.getElementById('aliasesVisualList');
+      if (rList) {
+        const rEntries = Object.entries(state.modelRoutes || {});
+        rList.innerHTML = rEntries.map(([g, ts]) =>
+          '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:#f8fafc;border:1px solid #dbe5f1;border-radius:8px;font-size:11px">' +
+            '<span><strong style="color:var(--cyan)">' + escapeHtml(g) + '</strong> ➔ ' + escapeHtml(Array.isArray(ts) ? ts.join(' → ') : String(ts)) + '</span>' +
+            '<button class="btn btn-sm btn-pink" onclick="removeVisualRoute(\\'' + escapeHtml(g) + '\\')">删</button>' +
+          '</div>'
+        ).join('') || '<div class="sub-row">暂未配置自定义路由组</div>';
+      }
+      if (aList) {
+        const aEntries = Object.entries(state.aliases || {});
+        aList.innerHTML = aEntries.map(([from, to]) =>
+          '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:#f8fafc;border:1px solid #dbe5f1;border-radius:8px;font-size:11px">' +
+            '<span><strong>' + escapeHtml(from) + '</strong> ➔ <span style="color:var(--emerald)">' + escapeHtml(to) + '</span></span>' +
+            '<button class="btn btn-sm btn-pink" onclick="removeVisualAlias(\\'' + escapeHtml(from) + '\\')">删</button>' +
+          '</div>'
+        ).join('') || '<div class="sub-row">暂未配置模型别名</div>';
+      }
+      const rtArea = document.getElementById('modelRoutesTextarea');
+      const alArea = document.getElementById('aliasesTextarea');
+      if (rtArea) rtArea.value = JSON.stringify(state.modelRoutes || {}, null, 2);
+      if (alArea) alArea.value = JSON.stringify(state.aliases || {}, null, 2);
+    }
+    function syncVisualFromJson() {
+      try {
+        state.modelRoutes = JSON.parse(document.getElementById('modelRoutesTextarea').value || '{}');
+        state.aliases = JSON.parse(document.getElementById('aliasesTextarea').value || '{}');
+        renderVisualRoutesAndAliases();
+      } catch (_) {}
+    }
+    function addVisualRoute() {
+      const name = document.getElementById('newRouteName').value.trim();
+      const ts = document.getElementById('newRouteTargets').value.split(',').map(s => s.trim()).filter(Boolean);
+      if (!name || ts.length === 0) return toast('请填写组名和至少一个目标模型');
+      state.modelRoutes = { ...(state.modelRoutes || {}), [name]: ts };
+      document.getElementById('newRouteName').value = '';
+      document.getElementById('newRouteTargets').value = '';
+      renderVisualRoutesAndAliases();
+    }
+    function removeVisualRoute(name) {
+      const next = { ...(state.modelRoutes || {}) }; delete next[name]; state.modelRoutes = next;
+      renderVisualRoutesAndAliases();
+    }
+    function addVisualAlias() {
+      const from = document.getElementById('newAliasFrom').value.trim();
+      const to = document.getElementById('newAliasTo').value.trim();
+      if (!from || !to) return toast('请填写请求模型名和映射目标');
+      state.aliases = { ...(state.aliases || {}), [from]: to };
+      document.getElementById('newAliasFrom').value = '';
+      document.getElementById('newAliasTo').value = '';
+      renderVisualRoutesAndAliases();
+    }
+    function removeVisualAlias(from) {
+      const next = { ...(state.aliases || {}) }; delete next[from]; state.aliases = next;
+      renderVisualRoutesAndAliases();
+    }
+    function addClaudePresetAliases() {
+      state.aliases = {
+        ...(state.aliases || {}),
+        'claude-sonnet-4-6': 'global:gpt-6.1-sol',
+        'claude-opus-4-6': 'global:gpt-6-astra',
+        'claude-haiku-4-5': 'cn:deepseek-v4.1-flash'
+      };
+      renderVisualRoutesAndAliases();
+      toast('已添加 Claude Code 常用别名映射（点击保存按钮生效）');
+    }
+
     async function loadModels() {
       const res = await api('/models'); if (!res.ok) return;
       state.models = res.models || []; state.enabledModels = res.enabledModels || [];
@@ -1028,8 +1451,7 @@ export function renderConsoleHtml(opts = {}) {
       state.modelRoutes = res.modelRoutes || {}; state.autoFreeEnabled = res.autoFreeEnabled !== false;
       document.getElementById('autoFreeToggle').checked = state.autoFreeEnabled;
       document.getElementById('freeModelsInput').value = state.freeModels.join(', ');
-      document.getElementById('modelRoutesTextarea').value = JSON.stringify(state.modelRoutes, null, 2);
-      document.getElementById('aliasesTextarea').value = JSON.stringify(state.aliases, null, 2);
+      renderVisualRoutesAndAliases();
       renderModelsTable();
       const pgSel = document.getElementById('pgModelSelect');
       if (pgSel) {
@@ -1085,9 +1507,16 @@ export function renderConsoleHtml(opts = {}) {
       const enabledModels = Array.from(document.querySelectorAll('.model-chk:checked')).map(el => el.value);
       const freeModels = document.getElementById('freeModelsInput').value.split(',').map(s => s.trim()).filter(Boolean);
       const autoFreeEnabled = document.getElementById('autoFreeToggle').checked;
-      let aliases, modelRoutes;
-      try { aliases = JSON.parse(document.getElementById('aliasesTextarea').value || '{}'); modelRoutes = JSON.parse(document.getElementById('modelRoutesTextarea').value || '{}'); }
-      catch (e) { return toast('JSON 格式错误: ' + e.message); }
+      let aliases = state.aliases || {};
+      let modelRoutes = state.modelRoutes || {};
+      const alArea = document.getElementById('aliasesTextarea');
+      const rtArea = document.getElementById('modelRoutesTextarea');
+      try {
+        if (alArea && alArea.value.trim()) aliases = JSON.parse(alArea.value);
+        if (rtArea && rtArea.value.trim()) modelRoutes = JSON.parse(rtArea.value);
+      } catch (e) {
+        return toast('高级 JSON 格式错误: ' + e.message);
+      }
       await api('/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabledModels, aliases, modelRoutes, freeModels, autoFreeEnabled }) });
       toast('模型路由、过滤与别名已保存'); loadModels();
     }
@@ -1193,6 +1622,35 @@ export function renderConsoleHtml(opts = {}) {
     }
     async function resetUsage() { if (!confirm('确认清空全部统计账本吗？')) return; await api('/stats/reset', { method: 'POST' }); toast('已清空'); loadUsage(); }
 
+    function copyText(text, label) {
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast('已复制 ' + label)).catch(() => {});
+    }
+    let _guideCopyList = [];
+    function copyGuide(idx) {
+      const item = _guideCopyList[idx];
+      if (item) copyText(item.copy, item.title);
+    }
+
+    function renderGuideCards(base) {
+      const el = document.getElementById('guideCardsGrid'); if (!el) return;
+      _guideCopyList = [
+        { title: 'OpenAI Chat 协议 (Cline / Cherry / Roo)', val: base + '/v1', copy: base + '/v1', tip: 'Base URL 填入此地址，Key 留空或填配置值；加 ?bare=true 返回无前缀模型名' },
+        { title: 'Claude Code CLI (Anthropic /v1/messages)', val: 'ANTHROPIC_BASE_URL=' + base, copy: '$env:ANTHROPIC_BASE_URL="' + base + '" ; $env:ANTHROPIC_API_KEY="sk-local"', tip: '支持 count_tokens 与流式错帧，建议在「模型与别名」中开启 Claude Code 映射' },
+        { title: 'Codex CLI (OpenAI Responses /v1/responses)', val: base + '/v1/responses', copy: base + '/v1', tip: '原生支持 reasoning_effort 与 tool_call 转换，Base URL 同填 /v1' },
+        { title: '健康探针 / 公开状态与视频生成', val: base + '/healthz', copy: base + '/healthz', tip: '视频生成: ' + base + '/v1/videos/generations · 公开门户: ' + base + '/portal' }
+      ];
+      el.innerHTML = _guideCopyList.map((c, idx) =>
+        '<div style="border:1px solid #dbe5f1;border-radius:10px;padding:12px;background:#f8fafc">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+            '<strong style="font-size:12px;color:#1e3a8a">' + escapeHtml(c.title) + '</strong>' +
+            '<button class="btn btn-sm" onclick="copyGuide(' + idx + ')">复制</button>' +
+          '</div>' +
+          '<div style="font-family:Consolas,monospace;font-size:11px;color:#2563eb;word-break:break-all;margin-bottom:4px">' + escapeHtml(c.val) + '</div>' +
+          '<div style="font-size:11px;color:#64748b">' + escapeHtml(c.tip) + '</div>' +
+        '</div>'
+      ).join('');
+    }
+
     function renderSettings() {
       const c = state.config || {};
       document.getElementById('cfgApiKey').value = c.apiKey || '';
@@ -1235,9 +1693,7 @@ export function renderConsoleHtml(opts = {}) {
       const evSet = new Set(al.events || ['ban','401','cooling','low_credit']);
       document.querySelectorAll('.alert-evt').forEach(el => { el.checked = evSet.has(el.value); });
 
-      const base = window.location.origin;
-      document.getElementById('guideCode').textContent =
-        'OpenAI Base URL  : ' + base + '/v1\\nAnthropic Base   : ' + base + '\\nResponses API    : ' + base + '/v1/responses\\nVideos API       : ' + base + '/v1/videos/generations\\nHealthz / Status : ' + base + '/healthz , ' + base + '/status';
+      renderGuideCards(window.location.origin);
     }
 
     async function saveConfig() {

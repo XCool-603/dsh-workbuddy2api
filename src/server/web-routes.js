@@ -8,19 +8,28 @@ import path from 'node:path';
 import { performCheckin } from '../upstream/checkin.js';
 import {
   getBuddyInfo,
+  agreeBuddy,
+  adoptFirstBuddy,
   getTravelStatus,
   departTravel,
-  claimTravel
+  claimTravel,
+  runTravelForAccount
 } from '../upstream/travel.js';
 import {
   getStreak,
+  redeemStreakTier,
+  checkAndUseMakeupCard,
+  claimGift,
+  claimCompensation,
+  reportActiveChat,
   getLotteryChances,
   drawLottery,
   claimAllWelfare
 } from '../upstream/growth.js';
 import {
   fetchGrowthTasks,
-  runAllGrowthTasks
+  runAllGrowthTasks,
+  isCSTNightWindow
 } from '../upstream/tasks.js';
 import {
   fetchSchoolStatus,
@@ -861,11 +870,59 @@ export function registerWebRoutes(ctx, deps) {
       }
     },
     {
+      path: '/plugins/dsh-workbuddy2api/travel/adopt',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const uid = body.uid || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        if (target.auth?.realm === 'global') {
+          sendJson(res, 400, { ok: false, message: '仅国内版账号支持猫猫系统' });
+          return;
+        }
+        await agreeBuddy(target);
+        let adoptRes = await adoptFirstBuddy(target);
+        if (!adoptRes.ok && adoptRes.incomplete) {
+          await reportActiveChat(target, 5);
+          adoptRes = await adoptFirstBuddy(target);
+        }
+        const buddy = await getBuddyInfo(target);
+        invalidateBalance(target.account.uid);
+        sendJson(res, 200, { ...adoptRes, buddy });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/travel/run',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const uid = body.uid || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        const resRun = await runTravelForAccount(target);
+        invalidateBalance(target.account.uid);
+        const acts = resRun.results?.actions || [];
+        const summary = resRun.status === 'ok'
+          ? (acts.map((a) => a.message).filter(Boolean).join('；') || '猫猫旅行巡检完成')
+          : (resRun.detail || resRun.reason || '猫猫巡检跳过或失败');
+        sendJson(res, 200, { ok: resRun.status === 'ok', summary, ...resRun });
+      }
+    },
+    {
       path: '/plugins/dsh-workbuddy2api/travel/run-all',
       handler: async (_req, res) => {
         const results = await scheduler.runAllTravel();
         invalidateBalance();
-        sendJson(res, 200, { ok: true, results });
+        sendJson(res, 200, {
+          ok: true,
+          results,
+          message: `已完成 ${results.length} 个国内版账号猫猫旅行巡检`
+        });
       }
     },
 
@@ -882,7 +939,78 @@ export function registerWebRoutes(ctx, deps) {
         }
         const streak = await getStreak(target);
         const chances = await getLotteryChances(target);
-        sendJson(res, 200, { ok: true, uid, streak, chances });
+        const rs = streak.redemptionStatus || {};
+        const tiers = [
+          { tier: '7d', label: '7天连登礼', status: rs.tier_7d_status || 'locked' },
+          { tier: '14d', label: '14天连登礼', status: rs.tier_14d_status || 'locked' },
+          { tier: '28d', label: '28天连登礼', status: rs.tier_28d_status || 'locked' }
+        ];
+        sendJson(res, 200, { ok: true, uid, streak, tiers, chances, chancesRemaining: chances });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/growth/redeem',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const uid = body.uid || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        const tier = body.tier || '7d';
+        const result = await redeemStreakTier(target, tier);
+        invalidateBalance(target.account.uid);
+        sendJson(res, 200, result);
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/growth/makeup',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const uid = body.uid || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        const result = await checkAndUseMakeupCard(target);
+        const msgMap = {
+          no_cards: '当前没有可用的补签卡',
+          no_missed_day: '昨日已打卡或无需补签',
+          skipped_global: '国际版账号无连登补签体系'
+        };
+        sendJson(res, 200, {
+          ...result,
+          message: result.message || msgMap[result.reason] || '补签检查完成'
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/growth/gift',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const uid = body.uid || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        const activeRes = await reportActiveChat(target, 5);
+        const giftRes = await claimGift(target);
+        const compRes = await claimCompensation(target);
+        const totalCredits = (giftRes.ok ? (giftRes.credit || 0) : 0) + (compRes.ok ? (compRes.credit || 0) : 0);
+        invalidateBalance(target.account.uid);
+        sendJson(res, 200, {
+          ok: Boolean(activeRes.ok || giftRes.ok || compRes.ok),
+          totalCredits,
+          items: [
+            { name: '对话活跃上报', ...activeRes },
+            { name: '新手礼包', ...giftRes },
+            { name: '活动补偿', ...compRes }
+          ],
+          message: `活跃与礼包巡检完成，累计获得 +${totalCredits} 积分`
+        });
       }
     },
     {
@@ -892,7 +1020,11 @@ export function registerWebRoutes(ctx, deps) {
         if (body.all) {
           const results = await scheduler.runAllWelfare();
           invalidateBalance();
-          sendJson(res, 200, { ok: true, results });
+          sendJson(res, 200, {
+            ok: true,
+            results,
+            message: `已完成 ${results.length} 个账号的全套福利与成长任务`
+          });
           return;
         }
         const uid = body.uid || store.activeUid;
@@ -903,7 +1035,7 @@ export function registerWebRoutes(ctx, deps) {
         }
         const result = await claimAllWelfare(target);
         invalidateBalance(target.account.uid);
-        sendJson(res, 200, { ok: true, uid, result });
+        sendJson(res, 200, { ok: true, uid, result, message: result.summary });
       }
     },
     {
@@ -1010,6 +1142,29 @@ export function registerWebRoutes(ctx, deps) {
         const result = await runSchoolActivity(target, opts);
         invalidateBalance(target.account.uid);
         sendJson(res, 200, { ok: Boolean(result?.ok), uid, result });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/tasks/nightcat',
+      handler: async (_req, res) => {
+        const inWindow = isCSTNightWindow();
+        if (!inWindow) {
+          sendJson(res, 200, {
+            ok: false,
+            inWindow: false,
+            results: [],
+            message: '当前不在深夜猫猫任务时间窗口（需北京时间 23:00–08:00）'
+          });
+          return;
+        }
+        const results = await scheduler.runAllNightCat();
+        invalidateBalance();
+        sendJson(res, 200, {
+          ok: true,
+          inWindow: true,
+          results,
+          message: `已完成 ${results.length} 个国内版账号深夜猫猫巡检`
+        });
       }
     },
 

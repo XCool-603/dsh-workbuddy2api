@@ -37,20 +37,30 @@ export function SettingsCard({ t }) {
   const [oauthModal, setOauthModal] = useState(null); // { realm, state, url, notice }
   const oauthTimerRef = useRef(null);
 
-  // 福利 / 猫猫 / 邀请 / 成长任务
+  // 福利 / 猫猫 / 邀请 / 成长任务 / 开学季
   const [selectedUid, setSelectedUid] = useState('');
   const [travelData, setTravelData] = useState(null);
+  const [travelLoc, setTravelLoc] = useState(4);
   const [growthData, setGrowthData] = useState(null);
   const [inviteInfo, setInviteInfo] = useState(null);
   const [bindCodeInput, setBindCodeInput] = useState('');
   const [tasksList, setTasksList] = useState([]);
+  const [schoolData, setSchoolData] = useState(null);
+  const [schoolResult, setSchoolResult] = useState(null);
+  const [welfareResult, setWelfareResult] = useState(null); // { title, badge, items: [{ label, ok, detail, gain }] }
   const [activityLogs, setActivityLogs] = useState([]);
 
   // 模型管理与倍率筛选
   const [modelSearch, setModelSearch] = useState('');
   const [modelFilter, setModelFilter] = useState('all');
+  const [aliasesMap, setAliasesMap] = useState({});
+  const [modelRoutesMap, setModelRoutesMap] = useState({});
   const [aliasesDraft, setAliasesDraft] = useState('{}');
   const [modelRoutesDraft, setModelRoutesDraft] = useState('{}');
+  const [newRouteName, setNewRouteName] = useState('');
+  const [newRouteTargets, setNewRouteTargets] = useState('');
+  const [newAliasFrom, setNewAliasFrom] = useState('');
+  const [newAliasTo, setNewAliasTo] = useState('');
   const [autoFreeDraft, setAutoFreeDraft] = useState(true);
   const [freeModelsDraft, setFreeModelsDraft] = useState('global:hy4free, cn:hy4free');
 
@@ -154,6 +164,8 @@ export function SettingsCard({ t }) {
       if (res.ok) {
         const data = await res.json();
         setModelsData(data);
+        setAliasesMap(data.aliases || {});
+        setModelRoutesMap(data.modelRoutes || {});
         setAliasesDraft(JSON.stringify(data.aliases || {}, null, 2));
         setModelRoutesDraft(JSON.stringify(data.modelRoutes || {}, null, 2));
         setAutoFreeDraft(data.autoFreeEnabled !== false);
@@ -194,10 +206,17 @@ export function SettingsCard({ t }) {
     const target = uid || selectedUid || status?.activeUid;
     if (!target) return;
     try {
-      const res = await fetch(`/plugins/dsh-workbuddy2api/tasks/list?uid=${encodeURIComponent(target)}`);
-      if (res.ok) {
-        const data = await res.json();
+      const [tRes, sRes] = await Promise.all([
+        fetch(`/plugins/dsh-workbuddy2api/tasks/list?uid=${encodeURIComponent(target)}`),
+        fetch(`/plugins/dsh-workbuddy2api/school/status?uid=${encodeURIComponent(target)}`)
+      ]);
+      if (tRes.ok) {
+        const data = await tRes.json();
         setTasksList(data.tasks || []);
+      }
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        setSchoolData(sData.status || null);
       }
     } catch (_) {}
   };
@@ -428,14 +447,27 @@ export function SettingsCard({ t }) {
     setModelsData((prev) => ({ ...prev, enabledModels: Array.from(current) }));
   };
 
+  const copyText = (txt, title) => {
+    if (navigator?.clipboard) {
+      navigator.clipboard.writeText(txt).then(() => setActionMsg(`📋 已复制 ${title}`)).catch(() => {});
+    }
+  };
+
+  const syncModelsDraft = (nextAliases, nextRoutes) => {
+    setAliasesMap(nextAliases);
+    setModelRoutesMap(nextRoutes);
+    setAliasesDraft(JSON.stringify(nextAliases, null, 2));
+    setModelRoutesDraft(JSON.stringify(nextRoutes, null, 2));
+  };
+
   const handleSaveModels = async () => {
-    let parsedAliases;
-    let parsedRoutes;
+    let parsedAliases = aliasesMap;
+    let parsedRoutes = modelRoutesMap;
     try {
-      parsedAliases = JSON.parse(aliasesDraft);
-      parsedRoutes = JSON.parse(modelRoutesDraft || '{}');
+      if (aliasesDraft.trim()) parsedAliases = JSON.parse(aliasesDraft);
+      if (modelRoutesDraft.trim()) parsedRoutes = JSON.parse(modelRoutesDraft);
     } catch (e) {
-      setActionMsg(`❌ JSON 格式错误: ${e.message}`);
+      setActionMsg(`❌ 高级 JSON 格式错误: ${e.message}`);
       return;
     }
     const freeModels = freeModelsDraft.split(',').map((s) => s.trim()).filter(Boolean);
@@ -795,7 +827,14 @@ export function SettingsCard({ t }) {
                     body: JSON.stringify({ all: true })
                   });
                   const data = await res.json();
-                  appendLog(`全号吃满福利完成: ${JSON.stringify(data.results?.length || 0)} 个账号`);
+                  const items = (data.results || []).map((r) => ({
+                    label: r.nickname || r.uid,
+                    ok: r.status !== 'error',
+                    detail: (Array.isArray(r.log) ? r.log.filter((l) => l.ok && l.message).slice(0, 2).map((l) => l.message).join(' · ') : '') || r.summary || '已完成',
+                    gain: r.totalCreditsGained ? `+${r.totalCreditsGained}分` : '-'
+                  }));
+                  setWelfareResult({ title: data.message || `已完成 ${items.length} 个账号全套福利`, badge: '全号完成', items });
+                  appendLog(data.message || `全号吃满福利完成，共处理 ${items.length} 个账号`);
                   fetchStatus(true);
                   notifyBalanceUpdate();
                 } finally {
@@ -803,7 +842,7 @@ export function SettingsCard({ t }) {
                 }
               }}
             >
-              全号一键吃满福利
+              🎁 全号一键吃满福利
             </button>
             <button
               className="wb2a-btn wb2a-btn-sm"
@@ -812,14 +851,25 @@ export function SettingsCard({ t }) {
                 try {
                   const res = await fetch('/plugins/dsh-workbuddy2api/travel/run-all', { method: 'POST' });
                   const data = await res.json();
-                  appendLog(`全池猫猫巡检完成 (${data.results?.length || 0} 个国内账号)`);
+                  const items = (data.results || []).map((r) => {
+                    const acts = r.results?.actions || [];
+                    const g = acts.reduce((acc, a) => acc + Number(a.rewardCredit || 0), 0);
+                    return {
+                      label: r.nickname || r.uid,
+                      ok: r.status === 'ok',
+                      detail: acts.map((a) => a.message).filter(Boolean).join('；') || r.detail || r.reason || '已完成',
+                      gain: g > 0 ? `+${g}分` : '-'
+                    };
+                  });
+                  setWelfareResult({ title: data.message || `全池猫猫巡检完成 (${items.length} 账号)`, badge: '猫猫巡检', items });
+                  appendLog(data.message || `全池猫猫巡检完成，共 ${items.length} 个国内账号`);
                   fetchActivityPanel();
                 } finally {
                   setLoading(false);
                 }
               }}
             >
-              全池巡检猫猫旅行
+              🐱 全池巡检猫猫旅行
             </button>
             <button
               className="wb2a-btn wb2a-btn-warn wb2a-btn-sm"
@@ -830,62 +880,228 @@ export function SettingsCard({ t }) {
                   body: JSON.stringify({ all: true })
                 });
                 const d = await res.json();
+                const items = (d.results || []).map((r) => ({
+                  label: r.nickname || r.uid,
+                  ok: Boolean(r.ok),
+                  detail: r.message || r.status || '已完成',
+                  gain: r.credit ? `+${r.credit}分` : '-'
+                }));
+                setWelfareResult({ title: d.message || '全池每日签到完成', badge: '每日签到', items });
                 appendLog(d.message || '全池签到完成');
                 fetchStatus(true);
                 notifyBalanceUpdate();
               }}
             >
-              全号每日签到
+              📅 全号每日签到
+            </button>
+            <button
+              className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+              onClick={async () => {
+                const res = await fetch('/plugins/dsh-workbuddy2api/growth/gift', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                });
+                const d = await res.json();
+                setWelfareResult({
+                  title: d.message || '礼包检查完成',
+                  badge: '礼包/活跃',
+                  items: (d.items || []).map((it) => ({
+                    label: it.name,
+                    ok: Boolean(it.ok),
+                    detail: it.message || '-',
+                    gain: it.credit ? `+${it.credit}分` : '-'
+                  }))
+                });
+                appendLog(d.message || '礼包检查完成');
+                fetchStatus(true);
+              }}
+            >
+              🎉 领新手礼/补偿
             </button>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
             <div className="wb2a-realm-card">
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
                 <strong style={{ fontSize: 13 }}>🐱 猫猫旅行管家</strong>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {travelData?.ok && !travelData?.travel?.isGlobal && !travelData?.buddy && (
+                    <button
+                      className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+                      onClick={async () => {
+                        const res = await fetch('/plugins/dsh-workbuddy2api/travel/adopt', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                        });
+                        const d = await res.json();
+                        setActionMsg(`${d.ok ? '🐱' : '⚠️'} ${d.message || '领养检查完成'}`);
+                        appendLog(d.message || '领养请求已执行');
+                        fetchActivityPanel();
+                        fetchStatus(true);
+                      }}
+                    >
+                      + 领养(+300)
+                    </button>
+                  )}
+                  {travelData?.travel?.state === 'arrived' && (
+                    <button
+                      className="wb2a-btn wb2a-btn-warn wb2a-btn-sm"
+                      onClick={async () => {
+                        const res = await fetch('/plugins/dsh-workbuddy2api/travel/claim', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ uid: selectedUid || status?.activeUid, recordId: travelData.travel.recordId })
+                        });
+                        const d = await res.json();
+                        setActionMsg(`${d.ok ? '🎁' : '⚠️'} ${d.message || '领奖完成'}`);
+                        appendLog(d.message || '领取旅行奖励完成');
+                        fetchActivityPanel();
+                        fetchStatus(true);
+                      }}
+                    >
+                      🎁 领奖励
+                    </button>
+                  )}
+                  <button
+                    className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                    onClick={async () => {
+                      const res = await fetch('/plugins/dsh-workbuddy2api/travel/run', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                      });
+                      const d = await res.json();
+                      setActionMsg(`🐱 ${d.summary || '单号巡检完成'}`);
+                      appendLog(d.summary || '单号自动巡检完成');
+                      fetchActivityPanel();
+                      fetchStatus(true);
+                    }}
+                  >
+                    ⚡ 自动跑
+                  </button>
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: '#475569', marginBottom: 8 }}>
+                {travelData?.travel?.isGlobal ? (
+                  <span>国际版账号无猫猫体系（请切换 CN 账号）</span>
+                ) : (
+                  <>
+                    宠物: <strong>{travelData?.buddy?.name || '未领养'}</strong> · 状态:{' '}
+                    <strong>
+                      {travelData?.travel?.state === 'arrived'
+                        ? '🎉 已到站可领奖'
+                        : travelData?.travel?.state === 'traveling'
+                          ? '✈️ 旅行中'
+                          : travelData?.travel?.state === 'idle'
+                            ? '空闲待派出'
+                            : (travelData?.travel?.state || '-')}
+                    </strong>
+                    {' · '}待领奖励: <strong style={{ color: '#059669' }}>+{travelData?.travel?.rewardCredit ?? 0}</strong>
+                  </>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <select className="wb2a-input" style={{ flex: 1 }} value={travelLoc} onChange={(e) => setTravelLoc(Number(e.target.value))}>
+                  <option value={4}>地点 4 · 古镇客栈 (推荐)</option>
+                  <option value={1}>地点 1 · 森林营地</option>
+                  <option value={2}>地点 2 · 海滨灯塔</option>
+                  <option value={3}>地点 3 · 雪山木屋</option>
+                </select>
                 <button
                   className="wb2a-btn wb2a-btn-sm"
                   onClick={async () => {
                     const res = await fetch('/plugins/dsh-workbuddy2api/travel/depart', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                      body: JSON.stringify({ uid: selectedUid || status?.activeUid, locationId: travelLoc })
                     });
                     const d = await res.json();
-                    appendLog(`猫猫出发结果: ${JSON.stringify(d)}`);
+                    setActionMsg(`${d.ok ? '✅' : '⚠️'} ${d.message || '派出指令已发送'}`);
+                    appendLog(d.message || '猫猫出发请求已发送');
                     fetchActivityPanel();
                   }}
                 >
                   派出旅行
                 </button>
               </div>
-              <div style={{ fontSize: 12, color: '#475569' }}>
-                宠物: {travelData?.buddy?.name || '未领养/仅CN支持'} · 状态: {travelData?.travel?.state || '-'} · 待领奖励: {travelData?.travel?.reward_credit || 0}
-              </div>
             </div>
 
             <div className="wb2a-realm-card">
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                <strong style={{ fontSize: 13 }}>🎰 连登福利与抽奖</strong>
-                <button
-                  className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
-                  onClick={async () => {
-                    const res = await fetch('/plugins/dsh-workbuddy2api/growth/lottery/draw', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ uid: selectedUid || status?.activeUid })
-                    });
-                    const d = await res.json();
-                    appendLog(`抽奖结果: ${JSON.stringify(d.result)}`);
-                    fetchActivityPanel();
-                    notifyBalanceUpdate();
-                  }}
-                >
-                  抽一次奖
-                </button>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
+                <strong style={{ fontSize: 13 }}>🎰 连登里程碑与抽奖</strong>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button
+                    className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                    onClick={async () => {
+                      const res = await fetch('/plugins/dsh-workbuddy2api/growth/makeup', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                      });
+                      const d = await res.json();
+                      setActionMsg(`🩹 ${d.message || '补签检查完成'}`);
+                      appendLog(d.message || '补签卡检查完成');
+                      fetchActivityPanel();
+                    }}
+                  >
+                    🩹 补签卡
+                  </button>
+                  <button
+                    className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+                    onClick={async () => {
+                      const res = await fetch('/plugins/dsh-workbuddy2api/growth/lottery/draw', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                      });
+                      const d = await res.json();
+                      const r = d.result || {};
+                      setActionMsg(`${r.ok ? '🎉' : 'ℹ️'} ${r.message || '暂无可用抽奖次数'}`);
+                      appendLog(r.message || '抽奖完成');
+                      fetchActivityPanel();
+                      notifyBalanceUpdate();
+                    }}
+                  >
+                    抽一次奖
+                  </button>
+                </div>
               </div>
-              <div style={{ fontSize: 12, color: '#475569' }}>
-                连登天数: {growthData?.streak?.streak_days ?? growthData?.streak?.days ?? '-'} · 抽奖次数: {growthData?.chances?.remaining ?? growthData?.chances?.chances ?? 0}
+              <div style={{ fontSize: 12, color: '#475569', marginBottom: 8 }}>
+                连登天数: <strong>{growthData?.streak?.days ?? 0} 天</strong>
+                {' · '}补签卡: <strong>{growthData?.streak?.makeupCards?.balance ?? 0}</strong> 张
+                {' · '}抽奖次数:{' '}
+                <strong style={{ color: '#2563eb' }}>
+                  {typeof growthData?.chances === 'number' ? growthData.chances : (growthData?.chancesRemaining ?? 0)}
+                </strong> 次
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {(growthData?.tiers || []).map((t) => (
+                  <div key={t.tier} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, padding: '3px 8px', borderRadius: 6, background: '#f8fafc', border: '1px solid #dbe5f1' }}>
+                    <span>{t.label}: {t.status === 'claimed' ? '✅已领' : t.status === 'available' ? '🌟可领' : '⏳未解锁'}</span>
+                    {t.status === 'available' && (
+                      <button
+                        className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+                        style={{ padding: '1px 6px', fontSize: 10 }}
+                        onClick={async () => {
+                          const res = await fetch('/plugins/dsh-workbuddy2api/growth/redeem', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ uid: selectedUid || status?.activeUid, tier: t.tier })
+                          });
+                          const d = await res.json();
+                          setActionMsg(`${d.ok ? '🎁' : '⚠️'} ${d.message || '兑换完成'}`);
+                          appendLog(d.message || `兑换 ${t.tier} 完成`);
+                          fetchActivityPanel();
+                          fetchStatus(true);
+                        }}
+                      >
+                        兑换
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
           </div>
@@ -922,7 +1138,7 @@ export function SettingsCard({ t }) {
                     body: JSON.stringify({ uid: selectedUid || status?.activeUid, inviteCode: bindCodeInput })
                   });
                   const d = await res.json();
-                  appendLog(`邀请绑定: ${d.message || JSON.stringify(d)}`);
+                  appendLog(`邀请绑定: ${d.message || (d.ok ? '绑定成功' : '绑定失败')}`);
                   setActionMsg(`${d.ok ? '✅' : '❌'} ${d.message || '绑定请求已执行'}`);
                   fetchStatus(true);
                 }}
@@ -932,7 +1148,30 @@ export function SettingsCard({ t }) {
             </div>
           </div>
 
-          <pre className="wb2a-code" style={{ maxHeight: 160 }}>{activityLogs.join('\n') || '暂无活动日志'}</pre>
+          {welfareResult && (
+            <div className="wb2a-realm-card" style={{ marginBottom: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <strong style={{ fontSize: 12 }}>📋 {welfareResult.title}</strong>
+                <span className="wb2a-badge wb2a-badge-success">{welfareResult.badge}</span>
+              </div>
+              <div style={{ maxHeight: 190, overflowY: 'auto' }}>
+                {(welfareResult.items || []).map((it, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: '1px solid #edf2f7', fontSize: 11, gap: 8 }}>
+                    <span><strong>{it.label}</strong> · <span style={{ color: '#475569' }}>{it.detail}</span></span>
+                    <span className={`wb2a-badge ${it.ok ? 'wb2a-badge-success' : 'wb2a-badge-warn'}`}>{it.gain !== '-' ? it.gain : (it.ok ? '成功' : '跳过')}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {activityLogs.length > 0 && (
+            <div style={{ fontSize: 11, color: '#64748b', background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 8, padding: '8px 10px' }}>
+              {activityLogs.slice(0, 5).map((l, i) => (
+                <div key={i} style={{ padding: '2px 0' }}>{l}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1009,7 +1248,9 @@ export function SettingsCard({ t }) {
                   });
                   const d = await res.json();
                   const r = d.result || {};
+                  setSchoolResult({ mode: 'single', result: r });
                   setActionMsg(`🏫 ${r.summary || `开学季: 完成 ${r.logs?.length || 0} 步, 抽奖 ${r.prizes?.length || 0} 次 (+${r.creditGained || 0} 分)`}`);
+                  await fetchTasksPanel();
                   await fetchStatus(true);
                   notifyBalanceUpdate();
                 } finally {
@@ -1031,7 +1272,9 @@ export function SettingsCard({ t }) {
                     body: JSON.stringify({ all: true })
                   });
                   const d = await res.json();
+                  setSchoolResult({ mode: 'all', results: d.results || [] });
                   setActionMsg(`🎓 全号开学季已完成 (${d.results?.length || 0} 账号)`);
+                  await fetchTasksPanel();
                   await fetchStatus(true);
                   notifyBalanceUpdate();
                 } finally {
@@ -1041,24 +1284,90 @@ export function SettingsCard({ t }) {
             >
               🎓 全号开学季抽奖
             </button>
+            <button
+              className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+              disabled={loading}
+              onClick={async () => {
+                setLoading(true);
+                try {
+                  const res = await fetch('/plugins/dsh-workbuddy2api/tasks/nightcat', { method: 'POST' });
+                  const d = await res.json();
+                  setActionMsg(`${d.ok ? '🦉' : '⏰'} ${d.message}`);
+                  if (d.ok) await fetchTasksPanel();
+                } finally {
+                  setLoading(false);
+                }
+              }}
+            >
+              🦉 深夜猫猫(23-08)
+            </button>
             <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => fetchTasksPanel()}>
               ↻ 刷新清单
             </button>
           </div>
 
+          {schoolData && (
+            <div className="wb2a-realm-card" style={{ marginBottom: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <strong style={{ fontSize: 12 }}>🎓 开学季活动 (school_open_day_2026)</strong>
+                <span className={`wb2a-badge ${schoolData.inPeriod ? 'wb2a-badge-success' : 'wb2a-badge-warn'}`}>
+                  {schoolData.skipped ? '仅CN支持' : !schoolData.ok ? '获取失败' : schoolData.inPeriod ? `进行中 · 转盘 ${schoolData.chance?.balance || 0} 次` : '未在活动期'}
+                </span>
+              </div>
+              {schoolData.inPeriod && (schoolData.tasks || []).length > 0 && (
+                <div style={{ fontSize: 11, color: '#475569' }}>
+                  {(schoolData.tasks || []).map((stItem, idx) => (
+                    <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', borderBottom: '1px solid #edf2f7' }}>
+                      <span>{stItem.title || stItem.task_code} ({stItem.progress || 0}/{stItem.target_count || 1})</span>
+                      <span className={`wb2a-badge ${stItem.status === 'claimed' || stItem.status === 'completed' ? 'wb2a-badge-success' : 'wb2a-badge-warn'}`}>
+                        {stItem.status || 'pending'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {schoolResult && schoolResult.mode === 'single' && (
+                <div style={{ marginTop: 6, fontSize: 11, color: '#0f172a' }}>
+                  <strong>{schoolResult.result?.summary || schoolResult.result?.message || '已执行'}</strong>
+                  {(schoolResult.result?.prizes || []).length > 0 && (
+                    <div style={{ marginTop: 4, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {schoolResult.result.prizes.map((p, idx) => (
+                        <span key={idx} className="wb2a-badge wb2a-badge-success">
+                          🎁 {p.label || p.prizeCode}{p.credit ? ` (+${p.credit})` : ''}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {schoolResult && schoolResult.mode === 'all' && (
+                <div style={{ marginTop: 6, maxHeight: 140, overflowY: 'auto' }}>
+                  {(schoolResult.results || []).map((r, idx) => (
+                    <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '3px 0', borderBottom: '1px solid #edf2f7' }}>
+                      <span><strong>{r.nickname || r.uid}</strong>: {r.summary || r.message || r.error || '完成'}</span>
+                      <span className="wb2a-badge wb2a-badge-success">+{r.creditGained || 0}分</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{ maxHeight: 360, overflowY: 'auto' }}>
             {tasksList.map((task, idx) => {
               const st = task.accept_status || (task.claimed ? 'claimed' : task.completed ? 'completed' : 'pending');
+              const cur = task.progress?.current ?? 0;
+              const tgt = task.progress?.target ?? 1;
               return (
                 <div key={task.task_code || task.code || idx} className="wb2a-account-item" style={{ padding: '8px 12px' }}>
                   <div>
                     <div style={{ fontSize: 12, fontWeight: 600 }}>{task.title || task.name || task.task_code}</div>
                     <div style={{ fontSize: 10, color: '#64748b' }}>
-                      {task.task_code || task.code} · 奖励 +{task.reward_credit || 0}
+                      {task.task_code || task.code} · 进度 {cur}/{tgt} · 奖励 +{task.reward_credit || 0} 分
                     </div>
                   </div>
                   <span className={`wb2a-badge ${st === 'claimed' ? 'wb2a-badge-success' : st === 'completed' ? 'wb2a-badge-warn' : ''}`}>
-                    {st === 'claimed' ? '已领奖' : st === 'completed' ? '待领取' : st === 'accepted' ? '进行中' : '未开始'}
+                    {st === 'claimed' ? '✅ 已领奖' : st === 'completed' ? '🌟 待领取' : st === 'accepted' ? '⏳ 进行中' : '⚪ 未开始'}
                   </span>
                 </div>
               );
@@ -1187,14 +1496,31 @@ export function SettingsCard({ t }) {
             </div>
 
             <div>
-              <label style={{ display: 'block', fontSize: 11, color: '#475569', marginBottom: 6 }}>
-                <input
-                  type="checkbox"
-                  checked={autoFreeDraft}
-                  onChange={(e) => setAutoFreeDraft(e.target.checked)}
-                />{' '}
-                开放 <code>auto-free</code> 免费多模型兜底池
-              </label>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <label style={{ fontSize: 11, color: '#475569' }}>
+                  <input
+                    type="checkbox"
+                    checked={autoFreeDraft}
+                    onChange={(e) => setAutoFreeDraft(e.target.checked)}
+                  />{' '}
+                  开放 <code>auto-free</code> 免费兜底池
+                </label>
+                <button
+                  className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                  onClick={() => {
+                    const nextAl = {
+                      ...aliasesMap,
+                      'claude-sonnet-4-6': 'global:gpt-6.1-sol',
+                      'claude-opus-4-6': 'global:gpt-6-astra',
+                      'claude-haiku-4-5': 'cn:deepseek-v4.1-flash'
+                    };
+                    syncModelsDraft(nextAl, modelRoutesMap);
+                    setActionMsg('✅ 已添加 Claude Code 常用映射（请点击保存按钮生效）');
+                  }}
+                >
+                  + Claude Code 常用映射
+                </button>
+              </div>
               <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>auto-free 智能免费路由顺序 (逗号分隔):</div>
               <input
                 className="wb2a-input"
@@ -1202,22 +1528,104 @@ export function SettingsCard({ t }) {
                 value={freeModelsDraft}
                 onChange={(e) => setFreeModelsDraft(e.target.value)}
               />
-              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>自定义故障转移路由组 modelRoutes (JSON):</div>
-              <textarea
-                className="wb2a-input"
-                rows={4}
-                style={{ fontFamily: 'monospace', marginBottom: 8 }}
-                value={modelRoutesDraft}
-                onChange={(e) => setModelRoutesDraft(e.target.value)}
-              />
-              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>客户端模型别名映射表 (JSON):</div>
-              <textarea
-                className="wb2a-input"
-                rows={7}
-                value={aliasesDraft}
-                onChange={(e) => setAliasesDraft(e.target.value)}
-                style={{ fontFamily: 'monospace' }}
-              />
+
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>自定义故障转移路由组 (如 fast):</div>
+              <div style={{ maxHeight: 90, overflowY: 'auto', marginBottom: 6 }}>
+                {Object.entries(modelRoutesMap).map(([gName, list]) => (
+                  <div key={gName} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, padding: '3px 6px', background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 6, marginBottom: 4 }}>
+                    <span><strong>{gName}</strong> ➔ {Array.isArray(list) ? list.join(' → ') : String(list)}</span>
+                    <button
+                      className="wb2a-btn wb2a-btn-danger wb2a-btn-sm"
+                      style={{ padding: '1px 6px', fontSize: 10 }}
+                      onClick={() => {
+                        const next = { ...modelRoutesMap };
+                        delete next[gName];
+                        syncModelsDraft(aliasesMap, next);
+                      }}
+                    >
+                      删
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+                <input className="wb2a-input" style={{ width: 75 }} placeholder="组名" value={newRouteName} onChange={(e) => setNewRouteName(e.target.value)} />
+                <input className="wb2a-input" style={{ flex: 1 }} placeholder="模型逗号分隔" value={newRouteTargets} onChange={(e) => setNewRouteTargets(e.target.value)} />
+                <button
+                  className="wb2a-btn wb2a-btn-sm"
+                  onClick={() => {
+                    const g = newRouteName.trim();
+                    const ts = newRouteTargets.split(',').map((s) => s.trim()).filter(Boolean);
+                    if (!g || ts.length === 0) return;
+                    syncModelsDraft(aliasesMap, { ...modelRoutesMap, [g]: ts });
+                    setNewRouteName('');
+                    setNewRouteTargets('');
+                  }}
+                >
+                  + 加组
+                </button>
+              </div>
+
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>客户端模型别名映射:</div>
+              <div style={{ maxHeight: 120, overflowY: 'auto', marginBottom: 6 }}>
+                {Object.entries(aliasesMap).map(([from, to]) => (
+                  <div key={from} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, padding: '3px 6px', background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 6, marginBottom: 4 }}>
+                    <span><strong>{from}</strong> ➔ <span style={{ color: '#059669' }}>{to}</span></span>
+                    <button
+                      className="wb2a-btn wb2a-btn-danger wb2a-btn-sm"
+                      style={{ padding: '1px 6px', fontSize: 10 }}
+                      onClick={() => {
+                        const next = { ...aliasesMap };
+                        delete next[from];
+                        syncModelsDraft(next, modelRoutesMap);
+                      }}
+                    >
+                      删
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+                <input className="wb2a-input" style={{ flex: 1 }} placeholder="请求名如 claude-sonnet-4-6" value={newAliasFrom} onChange={(e) => setNewAliasFrom(e.target.value)} />
+                <input className="wb2a-input" style={{ flex: 1 }} placeholder="真实模型" value={newAliasTo} onChange={(e) => setNewAliasTo(e.target.value)} />
+                <button
+                  className="wb2a-btn wb2a-btn-sm"
+                  onClick={() => {
+                    const f = newAliasFrom.trim();
+                    const t = newAliasTo.trim();
+                    if (!f || !t) return;
+                    syncModelsDraft({ ...aliasesMap, [f]: t }, modelRoutesMap);
+                    setNewAliasFrom('');
+                    setNewAliasTo('');
+                  }}
+                >
+                  + 加别名
+                </button>
+              </div>
+
+              <details style={{ fontSize: 11, color: '#64748b' }}>
+                <summary style={{ cursor: 'pointer' }}>高级 JSON 视图 (可选手改)</summary>
+                <textarea
+                  className="wb2a-input"
+                  rows={3}
+                  style={{ fontFamily: 'monospace', marginTop: 4, marginBottom: 4 }}
+                  value={modelRoutesDraft}
+                  onChange={(e) => {
+                    setModelRoutesDraft(e.target.value);
+                    try { setModelRoutesMap(JSON.parse(e.target.value || '{}')); } catch (_) {}
+                  }}
+                />
+                <textarea
+                  className="wb2a-input"
+                  rows={4}
+                  value={aliasesDraft}
+                  onChange={(e) => {
+                    setAliasesDraft(e.target.value);
+                    try { setAliasesMap(JSON.parse(e.target.value || '{}')); } catch (_) {}
+                  }}
+                  style={{ fontFamily: 'monospace' }}
+                />
+              </details>
             </div>
           </div>
         </div>
@@ -1802,13 +2210,25 @@ export function SettingsCard({ t }) {
             </div>
           </div>
 
-          <pre className="wb2a-code">
-{`OpenAI Chat Base URL : ${gatewayUrl}
-Anthropic Messages   : http://127.0.0.1:${port}/v1/messages
-OpenAI Responses     : http://127.0.0.1:${port}/v1/responses
-Video Generations    : http://127.0.0.1:${port}/v1/videos/generations
-Web Console / Portal : ${consoleUrl} | http://127.0.0.1:${port}/portal`}
-          </pre>
+          <div className="wb2a-realm-card">
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>🔌 其他 IDE / CLI 一键接入卡片 (Claude Code · Codex · Cline · Cursor)</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              {[
+                { title: 'OpenAI Chat 兼容 (Cline/Cherry/Roo)', val: gatewayUrl, copy: gatewayUrl },
+                { title: 'Claude Code CLI (Anthropic)', val: `http://127.0.0.1:${port}`, copy: `$env:ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" ; $env:ANTHROPIC_API_KEY="sk-local"` },
+                { title: 'Codex Responses API', val: `http://127.0.0.1:${port}/v1/responses`, copy: gatewayUrl },
+                { title: '独立 Console / 公开 Portal', val: consoleUrl, copy: consoleUrl }
+              ].map((c, idx) => (
+                <div key={idx} style={{ background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 8, padding: '8px 10px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <strong style={{ fontSize: 11, color: '#1e3a8a' }}>{c.title}</strong>
+                    <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" style={{ padding: '1px 6px', fontSize: 10 }} onClick={() => copyText(c.copy, c.title)}>复制</button>
+                  </div>
+                  <div style={{ fontFamily: 'Consolas, monospace', fontSize: 10, color: '#2563eb', wordBreak: 'break-all' }}>{c.val}</div>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1927,9 +2347,23 @@ Web Console / Portal : ${consoleUrl} | http://127.0.0.1:${port}/portal`}
               🚀 开始验证并批量入池
             </button>
             {importResult && (
-              <pre className="wb2a-code" style={{ marginTop: 10, maxHeight: 160 }}>
-                {JSON.stringify(importResult, null, 2)}
-              </pre>
+              <div style={{ marginTop: 10, padding: 10, background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 8, maxHeight: 180, overflowY: 'auto' }}>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                  <span className="wb2a-badge wb2a-badge-success">✅ 新增 {importResult.imported || 0}</span>
+                  <span className="wb2a-badge">🔄 更新 {importResult.updated || 0}</span>
+                  <span className={`wb2a-badge ${(importResult.failed || 0) > 0 ? 'wb2a-badge-warn' : 'wb2a-badge-success'}`}>❌ 失败 {importResult.failed || 0}</span>
+                  {importResult.error && <span style={{ fontSize: 11, color: '#dc2626' }}>{importResult.error}</span>}
+                  {!importResult.error && importResult.total === 0 && (
+                    <span style={{ fontSize: 11, color: '#d97706' }}>未识别到有效凭证，请检查格式</span>
+                  )}
+                </div>
+                {(importResult.details || importResult.results || importResult.items || []).slice(0, 20).map((it, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '3px 0', borderBottom: '1px solid #e2e8f0' }}>
+                    <span><strong>{it.nickname || it.uid || '未命名'}</strong> · {it.realm || importRealm}</span>
+                    <span className={`wb2a-badge ${it.ok !== false ? 'wb2a-badge-success' : 'wb2a-badge-warn'}`}>{it.status || (it.ok !== false ? '成功' : (it.error || '失败'))}</span>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         </div>
