@@ -399,6 +399,33 @@ async function main() {
       break;
     }
 
+    case 'health': {
+      try {
+        const res = await fetch('http://127.0.0.1:7863/healthz', { signal: AbortSignal.timeout(3000) });
+        const data = await res.json().catch(() => ({}));
+        console.log(JSON.stringify({ httpStatus: res.status, ...data }, null, 2));
+      } catch (err) {
+        console.error(`❌ 网关健康检查失败: ${err.message}`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case 'alerts-test': {
+      try {
+        const res = await fetch('http://127.0.0.1:7863/plugins/dsh-workbuddy2api/config/alerts/test', {
+          method: 'POST',
+          signal: AbortSignal.timeout(10000)
+        });
+        const data = await res.json().catch(() => ({}));
+        console.log(JSON.stringify(data, null, 2));
+      } catch (err) {
+        console.error(`❌ 测试告警发送失败: ${err.message}`);
+        process.exit(1);
+      }
+      break;
+    }
+
     case 'doctor': {
       console.log('\n=== WorkBuddy 2API 环境诊断 ===');
       console.log(`Node.js 版本: ${process.version}`);
@@ -421,7 +448,8 @@ DSH WorkBuddy 2API CLI 命令行工具
 
 可用命令:
   status [--json]      查看账号池运行状态与当前主号余额
-  models [--json]      向上游拉取当前账号真实可用模型清单
+  health               探测运行中网关 /healthz 与双域可用性
+  models [--json]      向上游拉取当前账号真实可用模型清单与倍率
   usage  [--json]      查看今日与近 7 天本机 Token 消耗与走势
   checkin              为当前激活账号执行每日签到或福利领取
   trial                🎁 为所有国际版 (Global) 账号领取 IDE Trial 加速包
@@ -432,6 +460,7 @@ DSH WorkBuddy 2API CLI 命令行工具
   travel [subcmd]      🐱 猫猫旅行管家 (status / depart / claim / run)
   welfare [subcmd]     🎁 活动福利体系 (claim / streak / draw)
   tasks [subcmd]       📋 成长任务引擎 (list / run - 自动点亮+领奖)
+  alerts-test          🔔 发送一次测试 Webhook 风控告警
   accounts             列出账号池内所有已保存的账号
   doctor               不泄露密钥的环境与存储健康检查
 `);

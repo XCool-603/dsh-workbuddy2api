@@ -50,33 +50,49 @@ export function SettingsCard({ t }) {
   const [modelSearch, setModelSearch] = useState('');
   const [modelFilter, setModelFilter] = useState('all');
   const [aliasesDraft, setAliasesDraft] = useState('{}');
+  const [modelRoutesDraft, setModelRoutesDraft] = useState('{}');
+  const [autoFreeDraft, setAutoFreeDraft] = useState(true);
   const [freeModelsDraft, setFreeModelsDraft] = useState('global:hy4free, cn:hy4free');
 
-  // 积分包明细弹窗 & 在线调试/实时流水
+  // 积分包明细弹窗 / 换 Token 弹窗 / 在线调试与安全管理
   const [packsModalAcc, setPacksModalAcc] = useState(null);
+  const [updTokenModal, setUpdTokenModal] = useState(null);
   const [liveLogs, setLiveLogs] = useState([]);
   const [inFlightList, setInFlightList] = useState([]);
   const [pgModel, setPgModel] = useState('auto-free');
   const [pgEffort, setPgEffort] = useState('');
   const [pgPrompt, setPgPrompt] = useState('你好，请用一句话自我介绍');
+  const [pgAttach, setPgAttach] = useState(null);
   const [pgOutput, setPgOutput] = useState('等待发送测试请求...');
   const [pgMetrics, setPgMetrics] = useState('');
   const [pgRunning, setPgRunning] = useState(false);
   const [dshInfo, setDshInfo] = useState(null);
+  const [usageDate, setUsageDate] = useState('');
+  const [updateInfo, setUpdateInfo] = useState(null);
 
-  // 网关设置表单
+  // 网关设置 / 安全 / 告警 / 排程 / 多租户表单
   const [cfgDraft, setCfgDraft] = useState({
     apiKey: '',
     proxy: '',
     maxInFlightCN: 3,
     maxInFlightGlobal: 2,
-    queueTimeoutMs: 5000,
+    queueTimeoutMs: 60000,
+    streamIdleTimeoutMs: 90000,
+    deviceTokenPath: '',
+    portalAsHome: false,
     promptMode: 'none',
     promptText: '',
     autoCheckin: true,
     autoTravel: true,
+    autoTasks: true,
     autoRefreshToken: true
   });
+  const [webPasswordDraft, setWebPasswordDraft] = useState('');
+  const [ipWlDraft, setIpWlDraft] = useState({ enabled: false, allowLocalhost: true, text: '' });
+  const [alertsDraft, setAlertsDraft] = useState({ enabled: false, minCredit: 50, webhooksText: '', events: ['ban', '401', 'cooling', 'low_credit'] });
+  const [schedDraft, setSchedDraft] = useState({ checkin: '9, 21', travel: '9, 21', tasks: '11', keepalive: '22' });
+  const [usersList, setUsersList] = useState([]);
+  const [newUserDraft, setNewUserDraft] = useState({ username: '', password: '', role: 'user', dailyCreditLimit: 0, rpm: 0 });
 
   const notifyBalanceUpdate = () => {
     try {
@@ -99,7 +115,33 @@ export function SettingsCard({ t }) {
         }
         if (data.config) {
           setCfgDraft((prev) => ({ ...prev, ...data.config }));
+          const wl = data.config.ipWhitelist || {};
+          setIpWlDraft({ enabled: Boolean(wl.enabled), allowLocalhost: wl.allowLocalhost !== false, text: (wl.allowedIPs || []).join('\n') });
+          const al = data.config.alerts || {};
+          setAlertsDraft({
+            enabled: Boolean(al.enabled),
+            minCredit: al.minCredit ?? 50,
+            webhooksText: (al.webhooks || []).join('\n'),
+            events: al.events || ['ban', '401', 'cooling', 'low_credit']
+          });
+          const sch = data.config.schedule || {};
+          setSchedDraft({
+            checkin: (sch.checkinHours || [9, 21]).join(', '),
+            travel: (sch.travelHours || [9, 21]).join(', '),
+            tasks: (sch.tasksHours || [11]).join(', '),
+            keepalive: (sch.keepaliveHours || [22]).join(', ')
+          });
         }
+      }
+    } catch (_) {}
+  };
+
+  const fetchAdminUsers = async () => {
+    try {
+      const res = await fetch('/plugins/dsh-workbuddy2api/admin/users');
+      if (res.ok) {
+        const d = await res.json();
+        setUsersList(d.users || []);
       }
     } catch (_) {}
   };
@@ -111,14 +153,16 @@ export function SettingsCard({ t }) {
         const data = await res.json();
         setModelsData(data);
         setAliasesDraft(JSON.stringify(data.aliases || {}, null, 2));
-        setFreeModelsDraft((data.freeModels || ['global:deepseek-v4.1-flash', 'cn:hy4free']).join(', '));
+        setModelRoutesDraft(JSON.stringify(data.modelRoutes || {}, null, 2));
+        setAutoFreeDraft(data.autoFreeEnabled !== false);
+        setFreeModelsDraft((data.freeModels || ['global:hy4free', 'cn:hy4free']).join(', '));
       }
     } catch (_) {}
   };
 
-  const fetchUsage = async () => {
+  const fetchUsage = async (dateVal = usageDate) => {
     try {
-      const res = await fetch('/plugins/dsh-workbuddy2api/usage');
+      const res = await fetch(`/plugins/dsh-workbuddy2api/usage${dateVal ? `?date=${encodeURIComponent(dateVal)}` : ''}`);
       if (res.ok) {
         const data = await res.json();
         setUsage(data.stats);
@@ -183,16 +227,39 @@ export function SettingsCard({ t }) {
     } catch (_) {}
   };
 
+  const handlePgFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    if (file.type.startsWith('image/')) {
+      reader.onload = () => setPgAttach({ kind: 'image', name: file.name, data: reader.result });
+      reader.readAsDataURL(file);
+    } else {
+      reader.onload = () => setPgAttach({ kind: 'text', name: file.name, data: String(reader.result || '').slice(0, 32000) });
+      reader.readAsText(file);
+    }
+  };
+
   const handleRunPlayground = async () => {
     setPgRunning(true);
     setPgOutput(`⏳ 正在请求 ${pgModel} ...`);
     setPgMetrics('请求中...');
     const t0 = Date.now();
     try {
+      const promptText = pgPrompt.trim() || '你好';
+      let contentPayload = promptText;
+      if (pgAttach?.kind === 'image') {
+        contentPayload = [
+          { type: 'text', text: promptText },
+          { type: 'image_url', image_url: { url: pgAttach.data } }
+        ];
+      } else if (pgAttach?.kind === 'text') {
+        contentPayload = `${promptText}\n\n[附件 ${pgAttach.name}]\n${pgAttach.data}`;
+      }
       const payload = {
         model: pgModel || 'auto-free',
         stream: false,
-        messages: [{ role: 'user', content: pgPrompt.trim() || '你好' }]
+        messages: [{ role: 'user', content: contentPayload }]
       };
       if (pgEffort) payload.reasoning_effort = pgEffort;
       const res = await fetch('/plugins/dsh-workbuddy2api/playground/chat', {
@@ -229,7 +296,7 @@ export function SettingsCard({ t }) {
     if (tab === 'models') fetchModels();
     if (tab === 'playground') { fetchModels(); fetchLogs(); }
     if (tab === 'usage') fetchUsage();
-    if (tab === 'settings') fetchDshCheck();
+    if (tab === 'settings') { fetchDshCheck(); fetchAdminUsers(); }
   }, [tab, selectedUid]);
 
   const handleAddAccount = async () => {
@@ -361,10 +428,12 @@ export function SettingsCard({ t }) {
 
   const handleSaveModels = async () => {
     let parsedAliases;
+    let parsedRoutes;
     try {
       parsedAliases = JSON.parse(aliasesDraft);
+      parsedRoutes = JSON.parse(modelRoutesDraft || '{}');
     } catch (e) {
-      setActionMsg(`❌ 别名 JSON 格式错误: ${e.message}`);
+      setActionMsg(`❌ JSON 格式错误: ${e.message}`);
       return;
     }
     const freeModels = freeModelsDraft.split(',').map((s) => s.trim()).filter(Boolean);
@@ -376,11 +445,13 @@ export function SettingsCard({ t }) {
         body: JSON.stringify({
           enabledModels: modelsData.enabledModels || [],
           aliases: parsedAliases,
+          modelRoutes: parsedRoutes,
+          autoFreeEnabled: autoFreeDraft,
           freeModels
         })
       });
       const data = await res.json();
-      setActionMsg(data.ok ? '✅ 模型启用规则与别名配置已保存' : `❌ 保存失败`);
+      setActionMsg(data.ok ? '✅ 模型路由组、过滤与别名配置已保存' : `❌ 保存失败`);
       await fetchModels();
     } finally {
       setLoading(false);
@@ -536,6 +607,36 @@ export function SettingsCard({ t }) {
             >
               一键清除全部熔断
             </button>
+            <button
+              className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+              disabled={loading}
+              onClick={async () => {
+                const r = await fetch('/plugins/dsh-workbuddy2api/checkin', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ all: true })
+                });
+                const d = await r.json();
+                setActionMsg(`📅 ${d.message || '批量签到完成'}`);
+                await fetchStatus(true);
+                notifyBalanceUpdate();
+              }}
+            >
+              全池每日签到
+            </button>
+            <button
+              className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+              disabled={loading}
+              onClick={async () => {
+                const r = await fetch('/plugins/dsh-workbuddy2api/trial/batch', { method: 'POST' });
+                const d = await r.json();
+                setActionMsg(`🎁 国际版批量 Trial 执行完成 (${d.results?.length || 0})`);
+                await fetchStatus(true);
+                notifyBalanceUpdate();
+              }}
+            >
+              批量领Trial
+            </button>
           </div>
 
           {accounts.map((acc) => {
@@ -549,12 +650,22 @@ export function SettingsCard({ t }) {
                     <strong>{acc.nickname || acc.uid.slice(0, 10)}</strong>
                     <span className="wb2a-badge">{acc.realm}</span>
                     {isAct && <span className="wb2a-badge wb2a-badge-success">当前优先</span>}
-                    {acc.disabled && <span className="wb2a-badge" style={{ color: '#dc2626', background: '#fef2f2', borderColor: '#fecaca' }}>已停用</span>}
-                    {!acc.disabled && diag.coolingDown && (
+                    {acc.manualDisabled && (
+                      <span className="wb2a-badge" style={{ color: '#dc2626', background: '#fef2f2', borderColor: '#fecaca' }}>手动停用</span>
+                    )}
+                    {!acc.manualDisabled && acc.disabled && (
+                      <span className="wb2a-badge" style={{ color: '#dc2626', background: '#fef2f2', borderColor: '#fecaca' }}>自动禁用</span>
+                    )}
+                    {!acc.disabled && !acc.manualDisabled && diag.coolingDown && (
                       <span className="wb2a-badge wb2a-badge-warn">熔断 {diag.cooldownRemainingSec}s</span>
                     )}
                     {diag.modelCooldowns?.length > 0 && (
                       <span className="wb2a-badge wb2a-badge-warn">{diag.modelCooldowns.length}模型冷却</span>
+                    )}
+                    {acc.checkinState && (
+                      <span className={`wb2a-badge ${acc.checkinState.ok ? 'wb2a-badge-success' : 'wb2a-badge-warn'}`}>
+                        {acc.checkinState.ok ? '今日已签' : '待重试'}
+                      </span>
                     )}
                   </div>
                   <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
@@ -584,18 +695,24 @@ export function SettingsCard({ t }) {
                   <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => setPacksModalAcc(acc)}>
                     包明细({bal.activePackCount || 0})
                   </button>
+                  <button
+                    className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                    onClick={() => setUpdTokenModal({ uid: acc.uid, nickname: acc.nickname, accessToken: '', refreshToken: '' })}
+                  >
+                    换Token
+                  </button>
                   <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => handleAdminAction(acc.uid, 'refresh')}>
                     刷新
                   </button>
                   <button
-                    className={`wb2a-btn wb2a-btn-sm ${acc.disabled ? 'wb2a-btn-success' : 'wb2a-btn-danger'}`}
-                    onClick={() => handleAdminAction(acc.uid, acc.disabled ? 'enable' : 'disable')}
+                    className={`wb2a-btn wb2a-btn-sm ${acc.manualDisabled ? 'wb2a-btn-success' : 'wb2a-btn-danger'}`}
+                    onClick={() => handleAdminAction(acc.uid, acc.manualDisabled ? 'manualEnable' : 'disable')}
                   >
-                    {acc.disabled ? '启用' : '停用'}
+                    {acc.manualDisabled ? '恢复' : '停用'}
                   </button>
-                  {(diag.coolingDown || diag.modelCooldowns?.length > 0) && (
+                  {(acc.disabled || diag.coolingDown || diag.modelCooldowns?.length > 0) && (
                     <button className="wb2a-btn wb2a-btn-warn wb2a-btn-sm" onClick={() => handleAdminAction(acc.uid, 'revive')}>
-                      解熔断
+                      复活
                     </button>
                   )}
                   {acc.realm === 'global' && (
@@ -1023,17 +1140,33 @@ export function SettingsCard({ t }) {
             </div>
 
             <div>
+              <label style={{ display: 'block', fontSize: 11, color: '#475569', marginBottom: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={autoFreeDraft}
+                  onChange={(e) => setAutoFreeDraft(e.target.checked)}
+                />{' '}
+                开放 <code>auto-free</code> 免费多模型兜底池
+              </label>
               <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>auto-free 智能免费路由顺序 (逗号分隔):</div>
               <input
                 className="wb2a-input"
-                style={{ marginBottom: 10 }}
+                style={{ marginBottom: 8 }}
                 value={freeModelsDraft}
                 onChange={(e) => setFreeModelsDraft(e.target.value)}
+              />
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>自定义故障转移路由组 modelRoutes (JSON):</div>
+              <textarea
+                className="wb2a-input"
+                rows={4}
+                style={{ fontFamily: 'monospace', marginBottom: 8 }}
+                value={modelRoutesDraft}
+                onChange={(e) => setModelRoutesDraft(e.target.value)}
               />
               <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>客户端模型别名映射表 (JSON):</div>
               <textarea
                 className="wb2a-input"
-                rows={13}
+                rows={7}
                 value={aliasesDraft}
                 onChange={(e) => setAliasesDraft(e.target.value)}
                 style={{ fontFamily: 'monospace' }}
@@ -1049,7 +1182,7 @@ export function SettingsCard({ t }) {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.15fr', gap: 12 }}>
             <div className="wb2a-realm-card">
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                <strong style={{ fontSize: 13 }}>🧪 在线对话测试 Playground</strong>
+                <strong style={{ fontSize: 13 }}>🧪 在线对话测试 Playground (支持图/文附件)</strong>
                 {pgMetrics && <span className="wb2a-badge">{pgMetrics}</span>}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: 6, marginBottom: 8 }}>
@@ -1077,9 +1210,17 @@ export function SettingsCard({ t }) {
                 onChange={(e) => setPgPrompt(e.target.value)}
                 placeholder="输入测试提示词..."
               />
-              <button className="wb2a-btn wb2a-btn-success wb2a-btn-sm" onClick={handleRunPlayground} disabled={pgRunning} style={{ marginBottom: 8 }}>
-                {pgRunning ? '⏳ 请求执行中...' : '🚀 发送测试请求'}
-              </button>
+              <div className="wb2a-toolbar" style={{ marginBottom: 8 }}>
+                <input type="file" accept="image/*,.txt,.md,.json,.js,.py" onChange={handlePgFileChange} style={{ fontSize: 11, maxWidth: 180 }} />
+                {pgAttach && (
+                  <button className="wb2a-btn wb2a-btn-danger wb2a-btn-sm" onClick={() => setPgAttach(null)}>
+                    清除({pgAttach.name})
+                  </button>
+                )}
+                <button className="wb2a-btn wb2a-btn-success wb2a-btn-sm" onClick={handleRunPlayground} disabled={pgRunning}>
+                  {pgRunning ? '⏳ 请求执行中...' : '🚀 发送测试'}
+                </button>
+              </div>
               <pre className="wb2a-code" style={{ minHeight: 110, maxHeight: 220 }}>{pgOutput}</pre>
             </div>
 
@@ -1143,7 +1284,21 @@ export function SettingsCard({ t }) {
           </div>
 
           <div className="wb2a-toolbar">
-            <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={fetchUsage}>
+            <span style={{ fontSize: 11, color: '#475569' }}>按日期查看:</span>
+            <select
+              className="wb2a-input"
+              style={{ width: 130 }}
+              value={usageDate || usage?.activeDate || ''}
+              onChange={(e) => {
+                setUsageDate(e.target.value);
+                fetchUsage(e.target.value);
+              }}
+            >
+              {(usage?.availableDates || []).map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+            <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => fetchUsage(usageDate)}>
               ↻ 刷新统计
             </button>
             <button
@@ -1253,8 +1408,26 @@ export function SettingsCard({ t }) {
               <input
                 type="number"
                 className="wb2a-input"
-                value={cfgDraft.queueTimeoutMs ?? 5000}
+                value={cfgDraft.queueTimeoutMs ?? 60000}
                 onChange={(e) => setCfgDraft({ ...cfgDraft, queueTimeoutMs: Number(e.target.value) })}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>流式空闲断连超时 (ms):</div>
+              <input
+                type="number"
+                className="wb2a-input"
+                value={cfgDraft.streamIdleTimeoutMs ?? 90000}
+                onChange={(e) => setCfgDraft({ ...cfgDraft, streamIdleTimeoutMs: Number(e.target.value) })}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>X-Device-Token 文件路径 (可选):</div>
+              <input
+                className="wb2a-input"
+                placeholder="~/.dsh/device_token"
+                value={cfgDraft.deviceTokenPath || ''}
+                onChange={(e) => setCfgDraft({ ...cfgDraft, deviceTokenPath: e.target.value })}
               />
             </div>
             <div>
@@ -1282,7 +1455,7 @@ export function SettingsCard({ t }) {
           </div>
 
           <div className="wb2a-toolbar" style={{ justifyContent: 'space-between' }}>
-            <div style={{ display: 'flex', gap: 12, fontSize: 12 }}>
+            <div style={{ display: 'flex', gap: 12, fontSize: 12, flexWrap: 'wrap' }}>
               <label>
                 <input
                   type="checkbox"
@@ -1302,15 +1475,251 @@ export function SettingsCard({ t }) {
               <label>
                 <input
                   type="checkbox"
+                  checked={cfgDraft.autoTasks !== false}
+                  onChange={(e) => setCfgDraft({ ...cfgDraft, autoTasks: e.target.checked })}
+                />{' '}
+                自动成长任务
+              </label>
+              <label>
+                <input
+                  type="checkbox"
                   checked={cfgDraft.autoRefreshToken !== false}
                   onChange={(e) => setCfgDraft({ ...cfgDraft, autoRefreshToken: e.target.checked })}
                 />{' '}
                 5分钟Token保活
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={Boolean(cfgDraft.portalAsHome)}
+                  onChange={(e) => setCfgDraft({ ...cfgDraft, portalAsHome: e.target.checked })}
+                />{' '}
+                首页(/)设为公开门户
+              </label>
             </div>
             <button className="wb2a-btn wb2a-btn-success" onClick={handleSaveConfig} disabled={loading}>
               💾 保存网关配置
             </button>
+          </div>
+
+          <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <strong style={{ fontSize: 12 }}>🛡️ 安全访问、密码锁定与 IP 白名单</strong>
+              <span className={`wb2a-badge ${status?.auth?.hasPassword ? 'wb2a-badge-warn' : 'wb2a-badge-success'}`}>
+                {status?.auth?.hasPassword ? '控制台已设密' : '单机免密模式'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+              <input
+                type="password"
+                className="wb2a-input"
+                placeholder="输入控制台新密码 (留空保存则清除)"
+                value={webPasswordDraft}
+                onChange={(e) => setWebPasswordDraft(e.target.value)}
+              />
+              <button
+                className="wb2a-btn wb2a-btn-warn wb2a-btn-sm"
+                onClick={async () => {
+                  const r = await fetch('/plugins/dsh-workbuddy2api/config/password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: webPasswordDraft })
+                  });
+                  const d = await r.json();
+                  setActionMsg(`🔐 ${d.message || '完成'}`);
+                  fetchStatus(false);
+                }}
+              >
+                设密/清密
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 11, marginBottom: 6, flexWrap: 'wrap' }}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={ipWlDraft.enabled}
+                  onChange={(e) => setIpWlDraft({ ...ipWlDraft, enabled: e.target.checked })}
+                />{' '}
+                启用 IP/CIDR 白名单
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={ipWlDraft.allowLocalhost}
+                  onChange={(e) => setIpWlDraft({ ...ipWlDraft, allowLocalhost: e.target.checked })}
+                />{' '}
+                放行本机回环
+              </label>
+              <button
+                className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                onClick={async () => {
+                  const allowedIPs = ipWlDraft.text.split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+                  const r = await fetch('/plugins/dsh-workbuddy2api/config/ip_whitelist', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: ipWlDraft.enabled, allowLocalhost: ipWlDraft.allowLocalhost, allowedIPs })
+                  });
+                  const d = await r.json();
+                  setActionMsg(d.ok ? `🛡️ ${d.message}` : `❌ ${d.error}`);
+                }}
+              >
+                保存白名单
+              </button>
+            </div>
+            <textarea
+              className="wb2a-input"
+              rows={2}
+              placeholder="每行或逗号分隔允许访问的 IP / CIDR，如 192.168.1.0/24"
+              value={ipWlDraft.text}
+              onChange={(e) => setIpWlDraft({ ...ipWlDraft, text: e.target.value })}
+            />
+          </div>
+
+          <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <strong style={{ fontSize: 12 }}>🔔 Webhook 风控告警 &amp; ⏰ CST 整点排程</strong>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  className="wb2a-btn wb2a-btn-warn wb2a-btn-sm"
+                  onClick={async () => {
+                    const r = await fetch('/plugins/dsh-workbuddy2api/config/alerts/test', { method: 'POST' });
+                    const d = await r.json();
+                    setActionMsg(d.ok ? `🔔 ${d.message}` : `❌ ${d.error}`);
+                  }}
+                >
+                  发测试告警
+                </button>
+                <button
+                  className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+                  onClick={async () => {
+                    const r = await fetch('/plugins/dsh-workbuddy2api/config/alerts', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        enabled: alertsDraft.enabled,
+                        minCredit: Number(alertsDraft.minCredit || 50),
+                        webhooksText: alertsDraft.webhooksText,
+                        events: alertsDraft.events
+                      })
+                    });
+                    const d = await r.json();
+                    setActionMsg(`🔔 ${d.message || '告警已保存'}`);
+                  }}
+                >
+                  保存告警
+                </button>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 10, fontSize: 11, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={alertsDraft.enabled}
+                  onChange={(e) => setAlertsDraft({ ...alertsDraft, enabled: e.target.checked })}
+                />{' '}
+                开启 Webhook 告警 (飞书/企微/钉钉/Telegram/Discord)
+              </label>
+              <label>
+                低积分预警阈值:{' '}
+                <input
+                  type="number"
+                  className="wb2a-input"
+                  style={{ width: 70, display: 'inline-block' }}
+                  value={alertsDraft.minCredit}
+                  onChange={(e) => setAlertsDraft({ ...alertsDraft, minCredit: Number(e.target.value) })}
+                />
+              </label>
+            </div>
+            <textarea
+              className="wb2a-input"
+              rows={2}
+              style={{ marginBottom: 8 }}
+              placeholder="Webhook URL (换行分隔多个地址)"
+              value={alertsDraft.webhooksText}
+              onChange={(e) => setAlertsDraft({ ...alertsDraft, webhooksText: e.target.value })}
+            />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr auto', gap: 6, alignItems: 'end' }}>
+              <div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>签到小时</div>
+                <input className="wb2a-input" value={schedDraft.checkin} onChange={(e) => setSchedDraft({ ...schedDraft, checkin: e.target.value })} />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>猫猫小时</div>
+                <input className="wb2a-input" value={schedDraft.travel} onChange={(e) => setSchedDraft({ ...schedDraft, travel: e.target.value })} />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>任务小时</div>
+                <input className="wb2a-input" value={schedDraft.tasks} onChange={(e) => setSchedDraft({ ...schedDraft, tasks: e.target.value })} />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>保活小时</div>
+                <input className="wb2a-input" value={schedDraft.keepalive} onChange={(e) => setSchedDraft({ ...schedDraft, keepalive: e.target.value })} />
+              </div>
+              <button
+                className="wb2a-btn wb2a-btn-sm"
+                onClick={async () => {
+                  const p = (s) => s.split(',').map((x) => Number(x.trim())).filter((n) => Number.isInteger(n) && n >= 0 && n <= 23);
+                  await fetch('/plugins/dsh-workbuddy2api/config/schedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      schedule: {
+                        checkinHours: p(schedDraft.checkin),
+                        travelHours: p(schedDraft.travel),
+                        tasksHours: p(schedDraft.tasks),
+                        keepaliveHours: p(schedDraft.keepalive)
+                      }
+                    })
+                  });
+                  setActionMsg('⏰ CST 自动排程小时已保存');
+                }}
+              >
+                保存排程
+              </button>
+            </div>
+          </div>
+
+          <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <strong style={{ fontSize: 12 }}>👥 多租户 Key 与版本更新检查 ({usersList.length} 用户)</strong>
+              <button
+                className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+                onClick={async () => {
+                  const r = await fetch('/plugins/dsh-workbuddy2api/system/update/check');
+                  const d = await r.json();
+                  setUpdateInfo(d);
+                  setActionMsg(d.ok ? `🔄 当前 v${d.currentVersion} / 最新 ${d.latestVersion}` : `❌ ${d.error}`);
+                }}
+              >
+                检查 GitHub 新版本
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
+              <input className="wb2a-input" style={{ width: 100 }} placeholder="新用户名" value={newUserDraft.username} onChange={(e) => setNewUserDraft({ ...newUserDraft, username: e.target.value })} />
+              <input className="wb2a-input" style={{ width: 100 }} type="password" placeholder="密码" value={newUserDraft.password} onChange={(e) => setNewUserDraft({ ...newUserDraft, password: e.target.value })} />
+              <input className="wb2a-input" style={{ width: 85 }} type="number" placeholder="日限额" value={newUserDraft.dailyCreditLimit} onChange={(e) => setNewUserDraft({ ...newUserDraft, dailyCreditLimit: Number(e.target.value) })} />
+              <input className="wb2a-input" style={{ width: 70 }} type="number" placeholder="RPM" value={newUserDraft.rpm} onChange={(e) => setNewUserDraft({ ...newUserDraft, rpm: Number(e.target.value) })} />
+              <button
+                className="wb2a-btn wb2a-btn-success wb2a-btn-sm"
+                onClick={async () => {
+                  const r = await fetch('/plugins/dsh-workbuddy2api/admin/users/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newUserDraft)
+                  });
+                  const d = await r.json();
+                  setActionMsg(d.ok ? `👤 已创建租户 ${d.user?.username} (${d.user?.apiKey})` : `❌ ${d.error}`);
+                  fetchAdminUsers();
+                }}
+              >
+                + 添加租户
+              </button>
+            </div>
+            {updateInfo && (
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>
+                当前 v{updateInfo.currentVersion} · 最新 {updateInfo.latestVersion || '-'} {updateInfo.hasUpdate ? '⚠️ 有新版本可用' : '✅ 已是最新'}
+              </div>
+            )}
           </div>
 
           <div className="wb2a-realm-card" style={{ marginBottom: 12 }}>
@@ -1341,8 +1750,59 @@ export function SettingsCard({ t }) {
 Anthropic Messages   : http://127.0.0.1:${port}/v1/messages
 OpenAI Responses     : http://127.0.0.1:${port}/v1/responses
 Video Generations    : http://127.0.0.1:${port}/v1/videos/generations
-Web Console URL      : ${consoleUrl}`}
+Web Console / Portal : ${consoleUrl} | http://127.0.0.1:${port}/portal`}
           </pre>
+        </div>
+      )}
+
+      {/* 换 Token 救活账号模态框 */}
+      {updTokenModal && (
+        <div className="wb2a-modal-backdrop">
+          <div className="wb2a-modal">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+              <strong>更新凭证 / 救活账号 — {updTokenModal.nickname || updTokenModal.uid}</strong>
+              <button className="wb2a-btn wb2a-btn-danger wb2a-btn-sm" onClick={() => setUpdTokenModal(null)}>
+                关闭
+              </button>
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>新 Access Token (可选):</div>
+              <textarea
+                className="wb2a-input"
+                rows={2}
+                value={updTokenModal.accessToken}
+                onChange={(e) => setUpdTokenModal({ ...updTokenModal, accessToken: e.target.value })}
+              />
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 11, color: '#475569', marginBottom: 4 }}>新 Refresh Token (推荐):</div>
+              <textarea
+                className="wb2a-input"
+                rows={3}
+                value={updTokenModal.refreshToken}
+                onChange={(e) => setUpdTokenModal({ ...updTokenModal, refreshToken: e.target.value })}
+              />
+            </div>
+            <button
+              className="wb2a-btn wb2a-btn-success"
+              onClick={async () => {
+                const res = await fetch('/plugins/dsh-workbuddy2api/accounts/update_token', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(updTokenModal)
+                });
+                const d = await res.json();
+                setActionMsg(d.ok ? `🔄 ${d.message}` : `❌ ${d.error}`);
+                if (d.ok) {
+                  setUpdTokenModal(null);
+                  fetchStatus(true);
+                  notifyBalanceUpdate();
+                }
+              }}
+            >
+              验证并立即救活账号
+            </button>
+          </div>
         </div>
       )}
 

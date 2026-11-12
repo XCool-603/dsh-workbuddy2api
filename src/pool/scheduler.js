@@ -5,13 +5,75 @@
 import { ErrKind } from '../constants.js';
 import { runTravelForAccount } from '../upstream/travel.js';
 import { claimAllWelfare } from '../upstream/growth.js';
+import { performCheckin } from '../upstream/checkin.js';
+import { runAllGrowthTasks } from '../upstream/tasks.js';
+import { getNextMidnightCSTMs } from '../upstream/hint.js';
 
 const STICKY_TTL_MS = 15 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
+const SCHEDULE_TICK_MS = 60 * 1000;
 const TOKEN_REFRESH_WINDOW_MS = 2 * 60 * 60 * 1000;
+const WAF_IP_WINDOW_MS = 60 * 1000;
+const WAF_IP_THRESHOLD = 2;
+const MODEL_BLOCK_BASE_MS = 6 * 3600 * 1000;
+const MODEL_BLOCK_MAX_MS = 24 * 3600 * 1000;
 
 function stripModelRealm(model = '') {
-  return String(model).replace(/^(cn|global):/i, '');
+  return String(model).replace(/^(cn|global|solo|trae):/i, '');
+}
+
+function getCSTDateHour() {
+  const cst = new Date(Date.now() + 8 * 3600 * 1000);
+  return {
+    date: cst.toISOString().slice(0, 10),
+    hour: cst.getUTCHours(),
+    slot: `${cst.toISOString().slice(0, 10)}-${cst.getUTCHours()}`
+  };
+}
+
+export class WafIPGate {
+  constructor(windowMs = WAF_IP_WINDOW_MS, threshold = WAF_IP_THRESHOLD) {
+    this.windowMs = windowMs;
+    this.threshold = threshold;
+    this.hits = new Map(); // uid -> ts
+    this.until = 0;
+  }
+
+  active(now = Date.now()) {
+    return now < this.until;
+  }
+
+  noteWaf(uid, now = Date.now()) {
+    if (this.active(now)) return true;
+    if (uid) this.hits.set(uid, now);
+    for (const [k, ts] of this.hits.entries()) {
+      if (now - ts > this.windowMs) this.hits.delete(k);
+    }
+    if (this.hits.size >= this.threshold) {
+      this.until = now + this.windowMs;
+      this.hits.clear();
+      console.warn(`[waf-ip] 60s 内 ${this.threshold}+ 不同账号命中 403，启用 IP 级止损至 ${new Date(this.until).toISOString()}`);
+      return true;
+    }
+    return false;
+  }
+}
+
+export class DegradeGate {
+  constructor() {
+    this.until = 0;
+  }
+
+  active(now = Date.now()) {
+    return now < this.until;
+  }
+
+  trigger(now = Date.now()) {
+    if (!this.active(now)) {
+      this.until = getNextMidnightCSTMs(now);
+    }
+    return this.until;
+  }
 }
 
 export class Scheduler {
@@ -19,12 +81,14 @@ export class Scheduler {
     this.store = accountStore;
     this.client = options.client || null;
     this.configStore = options.configStore || null;
+    this.alertManager = options.alertManager || null;
     this.maxInFlightCN = options.maxInFlightCN || 3;
     this.maxInFlightGlobal = options.maxInFlightGlobal || 2;
     this.queueTimeoutMs = options.queueTimeoutMs ?? 5000;
 
     this.circuitBreakers = new Map(); // uid -> { failures, cooldownUntil, kind, reason }
     this.modelBreakers = new Map();   // `${uid}::${bareModel}` -> { failures, cooldownUntil, kind, reason }
+    this.routeModelBreakers = new Map(); // fullOrBareModel -> cooldownUntil (多模型路由级别熔断)
     this.inFlight = new Map();        // uid -> current concurrent count
     this.inFlightRequests = new Map();// reqId -> { id, uid, nickname, realm, model, rate, mode, startedAt }
     this.accountCredits = new Map();  // uid -> { remain, expiringRemain, updatedAt }
@@ -32,7 +96,12 @@ export class Scheduler {
     this.accountStats = new Map();    // uid -> { successCount, failCount, lastSuccessAt, lastErrorAt, lastErrorMsg, lastModel }
     this.waiters = [];
 
+    this.wafIPGate = new WafIPGate();
+    this.degradeGate = new DegradeGate();
+    this._executedScheduleSlots = new Set();
+
     this.autoTimer = null;
+    this.scheduleTimer = null;
     this.keepaliveTimer = null;
   }
 
@@ -101,11 +170,31 @@ export class Scheduler {
     return false;
   }
 
+  isAccountUnavailable(acc) {
+    if (!acc) return true;
+    return typeof this.store?.isAccountUnavailable === 'function'
+      ? this.store.isAccountUnavailable(acc)
+      : Boolean(acc.disabled || acc.manualDisabled);
+  }
+
+  tripRouteModel(modelId, ttlMs = 60000) {
+    if (!modelId) return;
+    this.routeModelBreakers.set(String(modelId), Date.now() + ttlMs);
+  }
+
+  isRouteModelCooling(modelId) {
+    if (!modelId) return false;
+    const until = this.routeModelBreakers.get(String(modelId)) || 0;
+    if (Date.now() < until) return true;
+    if (until > 0) this.routeModelBreakers.delete(String(modelId));
+    return false;
+  }
+
   /**
    * 申请账号槽位租约
    */
   acquire(account) {
-    if (!account || account.disabled) return false;
+    if (this.isAccountUnavailable(account)) return false;
     const uid = account.account?.uid;
     if (!uid) return false;
     const current = this.inFlight.get(uid) || 0;
@@ -233,12 +322,29 @@ export class Scheduler {
     st.lastErrorMsg = message;
     if (bareModel) st.lastModel = bareModel;
 
-    // 请求侧内容违规或参数问题，属于客户端请求特征，不施加账号或模型熔断
+    // 请求侧内容违规、图片无效或参数问题，属于客户端请求特征，不施加账号或模型熔断
     if (
       kind === ErrKind.CONTENT_BLOCKED ||
       kind === ErrKind.BAD_PARAMS ||
-      kind === ErrKind.PROMPT_TOO_LONG
+      kind === ErrKind.PROMPT_TOO_LONG ||
+      kind === ErrKind.IMAGE_INVALID
     ) {
+      return;
+    }
+
+    // 11102 模型不存在 / 不支持该后端：按 (账号, 模型) 指数退避 6h -> 12h -> 24h
+    if (bareModel && kind === ErrKind.MODEL_BLOCKED) {
+      const mKey = `${uid}::${bareModel}`;
+      const prev = this.modelBreakers.get(mKey) || { failures: 0, cooldownUntil: 0, kind: '', reason: '' };
+      const hits = prev.failures + 1;
+      const ttl = Math.min(MODEL_BLOCK_MAX_MS, MODEL_BLOCK_BASE_MS * Math.pow(2, Math.min(hits - 1, 2)));
+      this.modelBreakers.set(mKey, {
+        failures: hits,
+        cooldownUntil: Date.now() + ttl,
+        kind,
+        reason: `11102 ${message}`
+      });
+      console.warn(`[scheduler] 账号 ${uid} 模型 [${bareModel}] 11102 后端不支持，负缓存 ${Math.round(ttl / 3600000)}h`);
       return;
     }
 
@@ -275,6 +381,9 @@ export class Scheduler {
     cb.reason = message;
 
     let cooldownMs = 60000;
+    const acc = this.store.get(uid);
+    const nick = acc?.account?.nickname || uid;
+
     switch (kind) {
       case ErrKind.SOFT_RATE:
         cooldownMs = Math.min(30000 * Math.pow(2, cb.failures - 1), 600000);
@@ -284,12 +393,22 @@ export class Scheduler {
         break;
       case ErrKind.SESSION_DEAD:
         cooldownMs = 7200000;
+        this.alertManager?.notifyAuthFailed(uid, nick, message);
+        if (cb.failures >= 2 && typeof this.store.setAutoDisabled === 'function') {
+          this.store.setAutoDisabled(uid, true, `凭证失效(401/12153): ${String(message).slice(0, 80)}`);
+          this.alertManager?.notifyBan(uid, nick, '连续 401/12153 会话失效自动禁用');
+        }
         break;
       case ErrKind.ACCOUNT_FAULT:
         cooldownMs = 43200000;
+        if (typeof this.store.setAutoDisabled === 'function') {
+          this.store.setAutoDisabled(uid, true, `账号异常(11140): ${String(message).slice(0, 80)}`);
+        }
+        this.alertManager?.notifyBan(uid, nick, message);
         break;
       case ErrKind.WAF_BLOCK:
         cooldownMs = 180000;
+        this.wafIPGate.noteWaf(uid);
         break;
       default:
         cooldownMs = 45000;
@@ -298,6 +417,27 @@ export class Scheduler {
     cb.cooldownUntil = Date.now() + cooldownMs;
     this.circuitBreakers.set(uid, cb);
     console.warn(`[scheduler] 账号 ${uid} 触发账号级熔断保护 (${kind}), 冷却时长 ${Math.round(cooldownMs / 1000)}s: ${message}`);
+  }
+
+  /**
+   * 免费模型额度耗尽触发的模型级精准墙钟冷却（对齐 quota.reset_at 或次日 00:00 CST，上限 24h）
+   */
+  cooldownFreeQuotaModel(uid, resetAtMs = 0, model = '', reason = '') {
+    const bare = stripModelRealm(model);
+    if (!uid || !bare) return;
+    const now = Date.now();
+    const maxCap = now + 24 * 3600 * 1000;
+    let until = resetAtMs && resetAtMs > now ? resetAtMs : getNextMidnightCSTMs(now);
+    if (until > maxCap) until = maxCap;
+
+    this.modelBreakers.set(`${uid}::${bare}`, {
+      failures: 1,
+      cooldownUntil: until,
+      resetAt: until,
+      kind: ErrKind.SOFT_RATE,
+      reason: reason || 'free_quota_exhausted'
+    });
+    console.warn(`[free-guard] 账号 ${uid} 免费模型 [${bare}] 额度耗尽，模型级锁定至 ${new Date(until).toISOString()}`);
   }
 
   /**
@@ -320,10 +460,82 @@ export class Scheduler {
    * 一键清除所有账号及模型冷却状态
    */
   clearAllCooldowns() {
-    const count = this.circuitBreakers.size + this.modelBreakers.size;
+    const count = this.circuitBreakers.size + this.modelBreakers.size + this.routeModelBreakers.size;
     this.circuitBreakers.clear();
     this.modelBreakers.clear();
+    this.routeModelBreakers.clear();
     return count;
+  }
+
+  getCountsDetailed(realmFilter = null) {
+    const now = Date.now();
+    const list = this.store.getAll().filter((a) => !realmFilter || (a.auth?.realm || 'cn') === realmFilter);
+    let total = 0;
+    let healthy = 0;
+    let cooling = 0;
+    let disabled = 0;
+    let manualDisabled = 0;
+    let inFlightFull = 0;
+
+    for (const acc of list) {
+      total++;
+      if (acc.manualDisabled) manualDisabled++;
+      if (acc.disabled || acc.manualDisabled) {
+        disabled++;
+        continue;
+      }
+      const cb = this.circuitBreakers.get(acc.account.uid);
+      if (cb && now < cb.cooldownUntil) {
+        cooling++;
+        continue;
+      }
+      if (this.getInFlight(acc.account.uid) >= this.getLimitForAccount(acc)) {
+        inFlightFull++;
+        continue;
+      }
+      healthy++;
+    }
+    return { total, healthy, cooling, disabled, manualDisabled, inFlightFull };
+  }
+
+  getPoolDiagnostics(bareModel = '', targetRealm = null) {
+    const now = Date.now();
+    const list = this.store.getAll().filter((a) => !targetRealm || (a.auth?.realm || 'cn') === targetRealm);
+    let earliestResetAt = 0;
+    let rateLimitedCount = 0;
+    let disabledCount = 0;
+    let busyCount = 0;
+
+    for (const acc of list) {
+      if (this.isAccountUnavailable(acc)) {
+        disabledCount++;
+        continue;
+      }
+      const uid = acc.account.uid;
+      const cb = this.circuitBreakers.get(uid);
+      const mb = bareModel ? this.modelBreakers.get(`${uid}::${stripModelRealm(bareModel)}`) : null;
+      const coolingUntil = Math.max(cb && now < cb.cooldownUntil ? cb.cooldownUntil : 0, mb && now < mb.cooldownUntil ? mb.cooldownUntil : 0);
+      if (coolingUntil > 0) {
+        rateLimitedCount++;
+        if (!earliestResetAt || coolingUntil < earliestResetAt) earliestResetAt = coolingUntil;
+        continue;
+      }
+      if (this.getInFlight(uid) >= this.getLimitForAccount(acc)) {
+        busyCount++;
+      }
+    }
+
+    const isRateLimited = list.length > 0 && rateLimitedCount > 0 && rateLimitedCount + disabledCount >= list.length;
+    return {
+      total: list.length,
+      disabled: disabledCount,
+      rateLimited: rateLimitedCount,
+      inFlightFull: busyCount,
+      isRateLimited,
+      earliestResetAt,
+      retryAfterSec: earliestResetAt > now ? Math.ceil((earliestResetAt - now) / 1000) : 0,
+      summary: `total=${list.length} disabled=${disabledCount} cooling=${rateLimitedCount} busy=${busyCount}`
+    };
   }
 
   /**
@@ -353,6 +565,8 @@ export class Scheduler {
       uid,
       disabled: !!acc?.disabled,
       disabledReason: acc?.disabledReason || '',
+      manualDisabled: !!acc?.manualDisabled,
+      manualDisabledReason: acc?.manualDisabledReason || '',
       inFlight: this.getInFlight(uid),
       limit: acc ? this.getLimitForAccount(acc) : this.maxInFlightCN,
       coolingDown,
@@ -396,10 +610,10 @@ export class Scheduler {
   }
 
   /**
-   * 选出当前最佳可用账号候选序列（跳过手动停用账号，融合 Sticky 亲和性、熔断状态与并发度）
+   * 选出当前最佳可用账号候选序列（跳过手动/自动停用账号，融合 Sticky 亲和性、熔断状态与并发度）
    */
   pickCandidates(targetRealm = null, options = {}) {
-    const accounts = this.store.getAll().filter((a) => !a.disabled);
+    const accounts = this.store.getAll().filter((a) => !this.isAccountUnavailable(a));
     if (accounts.length === 0) return [];
 
     const now = Date.now();
@@ -487,9 +701,17 @@ export class Scheduler {
     const { queueTimeoutMs } = this._getLimits();
     const waitMs = options.queueTimeoutMs ?? queueTimeoutMs;
 
-    const allEnabled = this.store.getAll().filter((a) => !a.disabled);
+    const allEnabled = this.store.getAll().filter((a) => !this.isAccountUnavailable(a));
     if (allEnabled.length === 0) {
       throw new Error('当前无可用启用账号，请在设置中添加或启用至少一个 WorkBuddy / CodeBuddy 账号');
+    }
+
+    if (this.wafIPGate.active()) {
+      const wafErr = new Error('waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped');
+      wafErr.status = 403;
+      wafErr.kind = ErrKind.WAF_BLOCK;
+      wafErr.code = 'waf_ip_blocked';
+      throw wafErr;
     }
 
     const pickOpts = { sessionKey: options.sessionKey, bareModel };
@@ -511,9 +733,14 @@ export class Scheduler {
           err.nonRetryable = (
             result.kind === ErrKind.CONTENT_BLOCKED ||
             result.kind === ErrKind.BAD_PARAMS ||
-            result.kind === ErrKind.PROMPT_TOO_LONG
+            result.kind === ErrKind.PROMPT_TOO_LONG ||
+            result.kind === ErrKind.IMAGE_INVALID
           );
           if (err.nonRetryable) {
+            throw err;
+          }
+          if (result.kind === ErrKind.WAF_BLOCK && this.wafIPGate.active()) {
+            err.code = 'waf_ip_blocked';
             throw err;
           }
           if (
@@ -521,6 +748,8 @@ export class Scheduler {
             result.kind === ErrKind.HARD_CREDIT ||
             result.kind === ErrKind.SESSION_DEAD ||
             result.kind === ErrKind.NOT_FOUND ||
+            result.kind === ErrKind.MODEL_BLOCKED ||
+            result.kind === ErrKind.ACCOUNT_FAULT ||
             result.kind === ErrKind.WAF_BLOCK ||
             result.kind === ErrKind.SERVER
           ) {
@@ -531,6 +760,9 @@ export class Scheduler {
           throw err;
         }
 
+        if (result?.degradedTriggered) {
+          this.degradeGate.trigger();
+        }
         this.recordSuccess(account, bareModel);
         if (options.sessionKey) {
           this._setStickyUid(options.sessionKey, bareModel, account.account.uid);
@@ -549,12 +781,14 @@ export class Scheduler {
         this.recordFailure(account, errKind, err.message, bareModel);
         this.release(account);
         lastError = err;
+        if (err.code === 'waf_ip_blocked') throw err;
         console.warn(`[scheduler] 账号 ${account.account.uid} 调用异常 (${errKind})，尝试容灾轮换:`, err.message);
         return null;
       }
     };
 
     for (const account of candidates) {
+      if (this.wafIPGate.active()) break;
       if (!this.acquire(account)) {
         continue;
       }
@@ -574,6 +808,15 @@ export class Scheduler {
         const res = await tryAccount(queuedAcc);
         if (res) return res;
       }
+    }
+
+    const diag = this.getPoolDiagnostics(bareModel, targetRealm);
+    if (diag.isRateLimited) {
+      this.alertManager?.notifyAllCooling(targetRealm || 'all', bareModel || rawModel);
+      const err = lastError || new Error('rate limited: all accounts are cooling down');
+      if (!err.status || err.status >= 500) err.status = 429;
+      if (diag.retryAfterSec > 0) err.retryAfterSec = diag.retryAfterSec;
+      throw err;
     }
 
     throw lastError || new Error('所有可用账号均并发占满或处于冷却保护期，请稍后重试');
@@ -670,11 +913,84 @@ export class Scheduler {
   }
 
   /**
-   * 启动后台自动化排程任务（猫猫旅行巡检 + 福利吃满 + 每 5 分钟 Token 保活）
+   * 对全量账号批量执行每日签到
+   */
+  async runAllSignin() {
+    const accounts = this.store.getAll().filter((a) => !a.disabled);
+    const results = [];
+    for (const acc of accounts) {
+      try {
+        const res = await performCheckin(acc);
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...res });
+      } catch (err) {
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: false, error: err.message });
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return results;
+  }
+
+  /**
+   * 对所有国内账号批量执行全量成长任务与活动领奖
+   */
+  async runAllTasks() {
+    const accounts = this.store.getAll().filter((a) => !a.disabled && a.auth?.realm !== 'global');
+    const results = [];
+    for (const acc of accounts) {
+      try {
+        const res = await runAllGrowthTasks(acc);
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: true, result: res });
+      } catch (err) {
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: false, error: err.message });
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    return results;
+  }
+
+  async _runScheduledHourTick() {
+    const cfg = this.configStore ? this.configStore.getAll() : {};
+    const sched = cfg.schedule || {};
+    const { hour, slot } = getCSTDateHour();
+
+    const oncePerSlot = (tag, fn) => {
+      const key = `${tag}:${slot}`;
+      if (this._executedScheduleSlots.has(key)) return;
+      this._executedScheduleSlots.add(key);
+      if (this._executedScheduleSlots.size > 200) {
+        const first = this._executedScheduleSlots.keys().next().value;
+        this._executedScheduleSlots.delete(first);
+      }
+      Promise.resolve().then(fn).catch((e) => console.warn(`[scheduler] 定时排程(${tag})异常:`, e.message));
+    };
+
+    if (sched.checkinEnabled !== false && cfg.autoCheckin !== false && (sched.checkinHours || [9, 21]).includes(hour)) {
+      oncePerSlot('checkin', () => this.runAllWelfare());
+    }
+    if (sched.travelEnabled !== false && cfg.autoTravel !== false && (sched.travelHours || [9, 21]).includes(hour)) {
+      oncePerSlot('travel', () => this.runAllTravel());
+    }
+    if (sched.tasksEnabled !== false && cfg.autoTasks !== false && (sched.tasksHours || [11]).includes(hour)) {
+      oncePerSlot('tasks', () => this.runAllTasks());
+    }
+    if (sched.keepaliveEnabled !== false && cfg.autoRefreshToken !== false && (sched.keepaliveHours || [22]).includes(hour)) {
+      oncePerSlot('keepalive', () => this.refreshAllTokens(false));
+    }
+  }
+
+  /**
+   * 启动后台自动化排程任务（定时小时排程 + 保活刷新 + 兜底巡检）
    */
   startAutoRoutines(intervalMs = 2 * 60 * 60 * 1000) {
+    if (!this.scheduleTimer) {
+      this.scheduleTimer = setInterval(() => {
+        this._runScheduledHourTick().catch(() => {});
+      }, SCHEDULE_TICK_MS);
+      if (this.scheduleTimer.unref) this.scheduleTimer.unref();
+    }
+
     if (!this.autoTimer) {
-      console.log(`[scheduler] 启动后台自动化排程：猫猫旅行与 Token 保活 (巡检周期 ${Math.round(intervalMs / 60000)} 分钟)`);
+      console.log(`[scheduler] 启动后台自动化排程：定时整点任务与 Token 保活 (兜底巡检 ${Math.round(intervalMs / 60000)} 分钟)`);
       this.autoTimer = setInterval(async () => {
         const cfg = this.configStore ? this.configStore.getAll() : {};
         try {
@@ -708,6 +1024,10 @@ export class Scheduler {
    * 停止后台自动化排程与保活定时器
    */
   stopAutoRoutines() {
+    if (this.scheduleTimer) {
+      clearInterval(this.scheduleTimer);
+      this.scheduleTimer = null;
+    }
     if (this.autoTimer) {
       clearInterval(this.autoTimer);
       this.autoTimer = null;

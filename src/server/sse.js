@@ -95,7 +95,8 @@ export function createSSELinePump(res, onEventOrOptions = {}) {
     onEvent = null,
     forwardRaw = true,
     heartbeatMs = SSE_PING_INTERVAL_MS,
-    startTime = Date.now()
+    startTime = Date.now(),
+    transformErrorFrame = null
   } = opts;
 
   let buffer = '';
@@ -172,6 +173,14 @@ export function createSSELinePump(res, onEventOrOptions = {}) {
         if (delta) {
           if (typeof delta.content === 'string') sawContentChars += delta.content.length;
           if (typeof delta.reasoning_content === 'string') sawContentChars += delta.reasoning_content.length;
+        }
+      }
+
+      if (parsed && parsed.error && typeof transformErrorFrame === 'function') {
+        const patched = transformErrorFrame(parsed);
+        if (patched) {
+          parsed = patched;
+          rawFrame = `data: ${JSON.stringify(patched)}`;
         }
       }
 

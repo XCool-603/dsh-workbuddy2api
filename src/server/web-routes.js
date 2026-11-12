@@ -27,8 +27,10 @@ import { claimGlobalTrial } from '../upstream/trial.js';
 import { fetchInviteInfo, bindInviteCode } from '../upstream/invite.js';
 import { batchImportAccounts, exportBackupZip } from '../pool/import-export.js';
 import { parseJWTClaims } from '../pool/account-store.js';
-import { renderConsoleHtml } from './dashboard-html.js';
-import { DEFAULT_MODEL_ALIASES } from '../constants.js';
+import { renderConsoleHtml, renderPortalHtml } from './dashboard-html.js';
+import { DEFAULT_MODEL_ALIASES, SERVICE_VERSION, GITHUB_REPO } from '../constants.js';
+import { UserManager } from './auth-users.js';
+import { extractTrustedClientIP, detectRuntimeIPs, parseWhitelistEntries } from './ip-whitelist.js';
 
 function sendJson(res, status, data) {
   if (res.writableEnded) return;
@@ -80,7 +82,7 @@ function createEmptyRealmSummary() {
 
 function accumulateSummary(bucket, acc, bal, coolingDown) {
   bucket.count += 1;
-  if (!acc.disabled) {
+  if (!acc.disabled && !acc.manualDisabled) {
     bucket.enabledCount += 1;
     if (!coolingDown) bucket.healthyCount += 1;
   }
@@ -96,11 +98,23 @@ function accumulateSummary(bucket, acc, bal, coolingDown) {
 }
 
 export function registerWebRoutes(ctx, deps) {
-  const { scheduler, client, ledger, loopback, configStore } = deps;
+  const { scheduler, client, ledger, loopback, configStore, userManager, alertManager } = deps;
   const store = scheduler.store;
 
   const balanceCache = new Map();
+  const checkinStateMap = new Map(); // uid -> { date, ok, status, message }
   const BALANCE_TTL = 20000; // 20s 实时缓存窗口
+
+  function markCheckinState(uid, res) {
+    if (!uid || !res) return;
+    const todayCST = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    checkinStateMap.set(uid, {
+      date: todayCST,
+      ok: Boolean(res.ok),
+      status: res.status || (res.ok ? 'SUCCESS' : 'FAIL'),
+      message: res.message || ''
+    });
+  }
 
   async function getAccountBalance(account, force = false) {
     if (!account) return null;
@@ -113,6 +127,7 @@ export function registerWebRoutes(ctx, deps) {
       const bal = await client.fetchBalance(account);
       balanceCache.set(uid, { data: bal, fetchedAt: Date.now() });
       scheduler.updateAccountCredits(uid, bal.remain, bal.expiringRemain);
+      alertManager?.notifyLowCredit(uid, account.account.nickname, bal.remain);
       return bal;
     } catch (err) {
       if (cached) return cached.data;
@@ -139,6 +154,19 @@ export function registerWebRoutes(ctx, deps) {
   };
 
   const getRuntimeCfg = () => (configStore ? configStore.getAll() : {});
+  const requireAdmin = (req, res) => {
+    if (!userManager) return true;
+    const auth = userManager.checkWebAuth(req);
+    if (!auth.ok) {
+      sendJson(res, 401, { ok: false, authRequired: true, error: '请先登录控制台' });
+      return false;
+    }
+    if (auth.user?.role !== 'admin') {
+      sendJson(res, 403, { ok: false, error: '需要管理员权限' });
+      return false;
+    }
+    return true;
+  };
 
   const routes = [
     // 1. 全局状态、3-Realm 积分汇总与诊断看板
@@ -147,6 +175,8 @@ export function registerWebRoutes(ctx, deps) {
       handler: async (req, res) => {
         const u = new URL(req.url, 'http://localhost');
         const force = u.searchParams.get('refresh') === '1';
+        const dateParam = u.searchParams.get('date') || '';
+        const sessionAuth = userManager ? userManager.checkWebAuth(req) : { ok: true, user: { username: 'admin', role: 'admin' } };
 
         const all = store.getAll();
         const active = store.getActive();
@@ -155,12 +185,14 @@ export function registerWebRoutes(ctx, deps) {
           cn: createEmptyRealmSummary(),
           global: createEmptyRealmSummary()
         };
+        const todayCST = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
 
         const accounts = await Promise.all(all.map(async (a) => {
           const uid = a.account.uid;
-          const bal = await getAccountBalance(a, force && !a.disabled);
+          const bal = await getAccountBalance(a, force && !scheduler.isAccountUnavailable(a));
           const diag = scheduler.getAccountDiagnostics(uid);
           const realmKey = a.auth?.realm === 'global' ? 'global' : 'cn';
+          const chk = checkinStateMap.get(uid);
 
           accumulateSummary(summary.all, a, bal, diag.coolingDown);
           accumulateSummary(summary[realmKey], a, bal, diag.coolingDown);
@@ -173,33 +205,55 @@ export function registerWebRoutes(ctx, deps) {
             provider: a.account.provider || '',
             disabled: Boolean(a.disabled),
             disabledReason: a.disabledReason || '',
+            manualDisabled: Boolean(a.manualDisabled),
+            manualDisabledReason: a.manualDisabledReason || '',
             source: a.source || '',
             inFlight: diag.inFlight,
             coolingDown: diag.coolingDown,
             diagnostics: diag,
             expiresAt: a.auth.expiresAt,
             updatedAt: a.updatedAt,
-            balance: bal
+            balance: bal,
+            checkinState: chk && chk.date === todayCST ? chk : null
           };
         }));
 
         const balance = active ? await getAccountBalance(active, force) : null;
         const cfg = getRuntimeCfg();
+        const visibleAccounts =
+          sessionAuth.ok && sessionAuth.user?.role === 'user' ? [] : accounts;
 
         sendJson(res, 200, {
           ok: true,
+          serviceVersion: SERVICE_VERSION,
           activeUid: store.activeUid,
-          accounts,
+          accounts: visibleAccounts,
           balance,
           summary,
           gatewayPort: loopback.actualPort || loopback.preferredPort,
           aliases: { ...DEFAULT_MODEL_ALIASES, ...(cfg.aliases || {}) },
+          modelRoutes: cfg.modelRoutes || {},
+          autoFreeEnabled: cfg.autoFreeEnabled !== false,
+          freeCandidates: loopback.getFreeModelCandidates(),
           enabledModels: cfg.enabledModels || Array.from(loopback.enabledModels),
           freeModels: cfg.freeModels || [],
           discoveredModelsCount: loopback.discoveredModels?.length || 0,
           inFlightRequests: scheduler.getInFlightRequests(),
+          wafIpBlocked: scheduler.wafIPGate.active(),
+          degradeActive: scheduler.degradeGate.active(),
+          runtimeNetwork: {
+            detectedIPs: detectRuntimeIPs(),
+            clientIP: extractTrustedClientIP(req)
+          },
+          auth: {
+            hasPassword: userManager ? userManager.hasWebPassword() : false,
+            authenticated: sessionAuth.ok,
+            currentUser: sessionAuth.user || null,
+            allowRegister: Boolean(cfg.allowRegister)
+          },
+          alertHistory: alertManager?.history || [],
           config: cfg,
-          stats: ledger.getStats(loopback.getModelCatalogMap())
+          stats: ledger.getStats(loopback.getModelCatalogMap(), dateParam)
         });
       }
     },
@@ -363,14 +417,20 @@ export function registerWebRoutes(ctx, deps) {
             sendJson(res, 200, { ok: true, message: `已启用账号 ${acc.account.nickname}` });
             return;
           }
+          if (action === 'manualEnable') {
+            store.setManualDisabled(uid, false, '');
+            sendJson(res, 200, { ok: true, message: `已解除账号 ${acc.account.nickname} 手动停用` });
+            return;
+          }
           if (action === 'disable') {
-            store.setDisabled(uid, true, body.reason || '手动停用');
-            sendJson(res, 200, { ok: true, message: `已停用账号 ${acc.account.nickname}` });
+            store.setManualDisabled(uid, true, body.reason || '手动停用');
+            sendJson(res, 200, { ok: true, message: `已手动停用账号 ${acc.account.nickname}` });
             return;
           }
           if (action === 'revive' || action === 'clearCooldown') {
+            store.reviveAccount(uid);
             scheduler.clearCooldown(uid);
-            sendJson(res, 200, { ok: true, message: `已解除 ${acc.account.nickname} 全部冷却状态` });
+            sendJson(res, 200, { ok: true, message: `已复活并解除 ${acc.account.nickname} 自动禁用/冷却状态` });
             return;
           }
           if (action === 'refresh') {
@@ -394,6 +454,37 @@ export function registerWebRoutes(ctx, deps) {
           sendJson(res, 400, { ok: false, error: `未知管控动作: ${action}` });
         } catch (err) {
           sendJson(res, 500, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/accounts/update_token',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const { uid, accessToken, refreshToken } = body;
+          const existing = store.get(uid);
+          if (!existing) {
+            sendJson(res, 404, { ok: false, error: '账号未找到' });
+            return;
+          }
+          const rawAccess = String(accessToken || '').trim();
+          const rawRefresh = String(refreshToken || '').trim();
+          if (!rawAccess && !rawRefresh) {
+            sendJson(res, 400, { ok: false, error: '必须提供新 Access Token 或 Refresh Token' });
+            return;
+          }
+          const acc = store.updateAccountToken(uid, rawAccess || existing.auth.accessToken, rawRefresh || existing.auth.refreshToken);
+          if (acc.auth.refreshToken && !rawAccess) {
+            await client.refreshToken(acc);
+            store.upsert(acc);
+          }
+          scheduler.clearCooldown(uid);
+          invalidateBalance(uid);
+          const balance = await getAccountBalance(acc, true);
+          sendJson(res, 200, { ok: true, message: `已更新并救活账号 ${acc.account.nickname}`, balance });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: `凭证更新失败: ${err.message}` });
         }
       }
     },
@@ -485,14 +576,17 @@ export function registerWebRoutes(ctx, deps) {
       handler: async (req, res) => {
         const body = await parseJsonBody(req);
         if (body.all) {
-          const list = store.getAll().filter((a) => !a.disabled);
+          const list = store.getAll().filter((a) => !scheduler.isAccountUnavailable(a));
           const results = [];
           for (const acc of list) {
             try {
               const r = await performCheckin(acc);
+              markCheckinState(acc.account.uid, r);
               results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...r });
             } catch (e) {
-              results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: false, message: e.message });
+              const errRes = { ok: false, status: 'FAIL', message: e.message };
+              markCheckinState(acc.account.uid, errRes);
+              results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...errRes });
             }
           }
           invalidateBalance();
@@ -506,18 +600,38 @@ export function registerWebRoutes(ctx, deps) {
           return;
         }
         const result = await performCheckin(target);
+        markCheckinState(target.account.uid, result);
         invalidateBalance(target.account.uid);
         sendJson(res, 200, result);
       }
     },
+    {
+      path: '/plugins/dsh-workbuddy2api/trial/batch',
+      handler: async (_req, res) => {
+        const globals = store.getAll().filter((a) => !scheduler.isAccountUnavailable(a) && a.auth?.realm === 'global');
+        const results = [];
+        for (const acc of globals) {
+          try {
+            const r = await claimGlobalTrial(acc, client);
+            results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...r });
+          } catch (e) {
+            results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: false, error: e.message });
+          }
+        }
+        invalidateBalance();
+        sendJson(res, 200, { ok: true, results });
+      }
+    },
 
-    // 12. 用量统计（含按模型倍率/消耗明细）、实时请求流水与账本重置
+    // 12. 用量统计（含历史日期筛选、按模型倍率/消耗明细）、实时请求流水与账本重置
     {
       path: '/plugins/dsh-workbuddy2api/usage',
-      handler: async (_req, res) => {
+      handler: async (req, res) => {
+        const u = new URL(req.url, 'http://localhost');
+        const dateParam = u.searchParams.get('date') || '';
         sendJson(res, 200, {
           ok: true,
-          stats: ledger.getStats(loopback.getModelCatalogMap()),
+          stats: ledger.getStats(loopback.getModelCatalogMap(), dateParam),
           inFlightRequests: scheduler.getInFlightRequests()
         });
       }
@@ -625,12 +739,20 @@ export function registerWebRoutes(ctx, deps) {
           if (Array.isArray(body.freeModels)) {
             patch.freeModels = body.freeModels;
           }
+          if (body.modelRoutes && typeof body.modelRoutes === 'object') {
+            patch.modelRoutes = body.modelRoutes;
+          }
+          if (typeof body.autoFreeEnabled === 'boolean') {
+            patch.autoFreeEnabled = body.autoFreeEnabled;
+          }
           const updated = configStore ? configStore.update(patch) : patch;
           sendJson(res, 200, {
             ok: true,
             enabledModels: updated.enabledModels || Array.from(loopback.enabledModels),
             aliases: updated.aliases || loopback.modelAliases,
-            freeModels: updated.freeModels || []
+            freeModels: updated.freeModels || [],
+            modelRoutes: updated.modelRoutes || {},
+            autoFreeEnabled: updated.autoFreeEnabled !== false
           });
         } else {
           const cfg = getRuntimeCfg();
@@ -639,7 +761,9 @@ export function registerWebRoutes(ctx, deps) {
             models: loopback.getMergedModels(true),
             enabledModels: cfg.enabledModels || Array.from(loopback.enabledModels),
             aliases: { ...DEFAULT_MODEL_ALIASES, ...(cfg.aliases || {}) },
-            freeModels: cfg.freeModels || []
+            freeModels: cfg.freeModels || [],
+            modelRoutes: cfg.modelRoutes || {},
+            autoFreeEnabled: cfg.autoFreeEnabled !== false
           });
         }
       }
@@ -860,8 +984,395 @@ export function registerWebRoutes(ctx, deps) {
           sendJson(res, 500, { ok: false, error: err.message });
         }
       }
+    },
+
+    // 19. 控制台登录鉴权、自助注册与个人 API Key 管理
+    {
+      path: '/plugins/dsh-workbuddy2api/auth/me',
+      handler: async (req, res) => {
+        if (!userManager) {
+          sendJson(res, 200, { ok: true, hasPassword: false, authenticated: true, user: { username: 'admin', role: 'admin' } });
+          return;
+        }
+        const cfg = getRuntimeCfg();
+        const check = userManager.checkWebAuth(req);
+        sendJson(res, 200, {
+          ok: true,
+          hasPassword: userManager.hasWebPassword(),
+          authenticated: check.ok,
+          allowRegister: Boolean(cfg.allowRegister),
+          user: check.ok ? check.user : null
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/auth/login',
+      handler: async (req, res) => {
+        if (!userManager) {
+          sendJson(res, 501, { ok: false, error: 'UserManager 未初始化' });
+          return;
+        }
+        try {
+          const body = await parseJsonBody(req);
+          const clientIP = extractTrustedClientIP(req);
+          const { token, user } = userManager.authenticate(body.username || 'admin', body.password || '', clientIP);
+          res.setHeader(
+            'Set-Cookie',
+            `${UserManager.cookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 86400}`
+          );
+          sendJson(res, 200, { ok: true, user, token });
+        } catch (err) {
+          sendJson(res, 401, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/auth/logout',
+      handler: async (req, res) => {
+        userManager?.logout(req);
+        res.setHeader(
+          'Set-Cookie',
+          `${UserManager.cookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+        );
+        sendJson(res, 200, { ok: true });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/auth/register',
+      handler: async (req, res) => {
+        if (!userManager) {
+          sendJson(res, 501, { ok: false, error: 'UserManager 未初始化' });
+          return;
+        }
+        const cfg = getRuntimeCfg();
+        if (!cfg.allowRegister) {
+          sendJson(res, 403, { ok: false, error: '管理员已关闭自助注册功能' });
+          return;
+        }
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.createUser({
+            username: body.username,
+            password: body.password,
+            role: 'user'
+          });
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/user/apikey/reset',
+      handler: async (req, res) => {
+        if (!userManager) {
+          sendJson(res, 501, { ok: false, error: 'UserManager 未初始化' });
+          return;
+        }
+        const auth = userManager.checkWebAuth(req);
+        if (!auth.ok || !auth.user) {
+          sendJson(res, 401, { ok: false, error: '请先登录' });
+          return;
+        }
+        const updated = userManager.resetUserApiKey(auth.user.username);
+        sendJson(res, 200, { ok: true, apiKey: updated.apiKey, user: updated });
+      }
+    },
+
+    // 20. 控制台密码、IP/CIDR 白名单、Webhook 告警与自动化排程设置
+    {
+      path: '/plugins/dsh-workbuddy2api/config/password',
+      handler: async (req, res) => {
+        if (!userManager) {
+          sendJson(res, 501, { ok: false, error: 'UserManager 未初始化' });
+          return;
+        }
+        const body = await parseJsonBody(req);
+        const result = userManager.setAdminPassword(String(body.password || ''));
+        sendJson(res, 200, {
+          ok: true,
+          ...result,
+          message: result.hasPassword ? '控制台登录密码已更新启用' : '控制台密码已清除（单机免密模式）'
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/config/ip_whitelist',
+      handler: async (req, res) => {
+        if (req.method === 'GET') {
+          const cfg = getRuntimeCfg();
+          sendJson(res, 200, {
+            ok: true,
+            ipWhitelist: cfg.ipWhitelist,
+            detectedIPs: detectRuntimeIPs(),
+            clientIP: extractTrustedClientIP(req)
+          });
+          return;
+        }
+        try {
+          const body = await parseJsonBody(req);
+          const { normalized } = parseWhitelistEntries(Array.isArray(body.allowedIPs) ? body.allowedIPs : []);
+          const next = {
+            enabled: Boolean(body.enabled),
+            allowedIPs: normalized,
+            allowLocalhost: body.allowLocalhost !== false
+          };
+          const updated = configStore ? configStore.update({ ipWhitelist: next }) : { ipWhitelist: next };
+          sendJson(res, 200, {
+            ok: true,
+            ipWhitelist: updated.ipWhitelist,
+            message: 'IP 白名单规则已保存并即时生效'
+          });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/config/alerts',
+      handler: async (req, res) => {
+        if (req.method === 'GET') {
+          const cfg = getRuntimeCfg();
+          sendJson(res, 200, {
+            ok: true,
+            alerts: cfg.alerts,
+            history: alertManager?.history || []
+          });
+          return;
+        }
+        const body = await parseJsonBody(req);
+        const webhooks = Array.isArray(body.webhooks)
+          ? body.webhooks.map((s) => String(s).trim()).filter(Boolean)
+          : String(body.webhooksText || '').split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+        const events = Array.isArray(body.events) && body.events.length > 0
+          ? body.events
+          : ['ban', '401', 'cooling', 'low_credit'];
+        const nextAlerts = {
+          enabled: Boolean(body.enabled),
+          webhooks,
+          events,
+          minCredit: Math.max(0, Number(body.minCredit ?? 50) || 0)
+        };
+        const updated = configStore ? configStore.update({ alerts: nextAlerts }) : { alerts: nextAlerts };
+        sendJson(res, 200, {
+          ok: true,
+          alerts: updated.alerts,
+          message: 'Webhook 风控告警配置已保存'
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/config/alerts/test',
+      handler: async (_req, res) => {
+        if (!alertManager) {
+          sendJson(res, 501, { ok: false, error: 'AlertManager 未初始化' });
+          return;
+        }
+        const result = await alertManager.sendTestAlert();
+        sendJson(res, result.ok ? 200 : 400, {
+          ...result,
+          history: alertManager.history,
+          message: result.ok ? '测试告警已成功推送' : '测试告警推送失败，请检查 Webhook 地址'
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/config/schedule',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const updated = configStore
+          ? configStore.update({
+              schedule: body.schedule,
+              autoCheckin: body.autoCheckin,
+              autoTravel: body.autoTravel,
+              autoTasks: body.autoTasks,
+              autoRefreshToken: body.autoRefreshToken
+            })
+          : body;
+        sendJson(res, 200, { ok: true, config: updated, message: '自动化排程设置已保存' });
+      }
+    },
+
+    // 21. 多租户用户与配额管控 (admin 专属)
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users',
+      handler: async (_req, res) => {
+        if (!userManager) {
+          sendJson(res, 200, { ok: true, users: [], allowRegister: false });
+          return;
+        }
+        const cfg = getRuntimeCfg();
+        sendJson(res, 200, {
+          ok: true,
+          users: userManager.listUsers(),
+          allowRegister: Boolean(cfg.allowRegister)
+        });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/create',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.createUser(body);
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/toggle',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.toggleUser(body.username, body.disabled);
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/role',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.setUserRole(body.username, body.role);
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/quota',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.setUserQuota(body.username, body.dailyCreditLimit, body.rpm);
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/reset_password',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.resetUserPassword(body.username, body.password);
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/reset_key',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          const user = userManager.resetUserApiKey(body.username);
+          sendJson(res, 200, { ok: true, user });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/users/delete',
+      handler: async (req, res) => {
+        try {
+          const body = await parseJsonBody(req);
+          userManager.deleteUser(body.username);
+          sendJson(res, 200, { ok: true });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, error: err.message });
+        }
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/admin/system/allow_register',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const updated = configStore ? configStore.update({ allowRegister: Boolean(body.allowRegister) }) : body;
+        sendJson(res, 200, { ok: true, allowRegister: Boolean(updated.allowRegister) });
+      }
+    },
+
+    // 22. GitHub Releases 版本检查
+    {
+      path: '/plugins/dsh-workbuddy2api/system/update/check',
+      handler: async (_req, res) => {
+        try {
+          const apiRes = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, {
+            headers: { 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'dsh-workbuddy2api-updater' },
+            signal: AbortSignal.timeout(8000)
+          });
+          if (apiRes.status === 404) {
+            const tagsRes = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/tags?per_page=1`, {
+              headers: { 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'dsh-workbuddy2api-updater' },
+              signal: AbortSignal.timeout(8000)
+            });
+            const tags = await tagsRes.json().catch(() => []);
+            const latestTag = Array.isArray(tags) && tags[0]?.name ? tags[0].name : `v${SERVICE_VERSION}`;
+            const normLatest = latestTag.replace(/^v/i, '');
+            sendJson(res, 200, {
+              ok: true,
+              currentVersion: SERVICE_VERSION,
+              latestVersion: latestTag,
+              hasUpdate: normLatest !== SERVICE_VERSION && latestTag !== `v${SERVICE_VERSION}`,
+              repoUrl: `https://github.com/${GITHUB_REPO}`,
+              releaseNotes: '当前仓库暂无正式 Release，已读取最新 Git Tag。'
+            });
+            return;
+          }
+          if (!apiRes.ok) {
+            throw new Error(`GitHub API HTTP ${apiRes.status}`);
+          }
+          const rel = await apiRes.json();
+          const latestVersion = String(rel.tag_name || '').trim();
+          const normLatest = latestVersion.replace(/^v/i, '');
+          sendJson(res, 200, {
+            ok: true,
+            currentVersion: SERVICE_VERSION,
+            latestVersion,
+            hasUpdate: Boolean(normLatest && normLatest !== SERVICE_VERSION),
+            releaseTitle: rel.name || latestVersion,
+            releaseNotes: rel.body || '',
+            releaseUrl: rel.html_url || `https://github.com/${GITHUB_REPO}/releases`,
+            publishedAt: rel.published_at || ''
+          });
+        } catch (err) {
+          sendJson(res, 200, {
+            ok: false,
+            currentVersion: SERVICE_VERSION,
+            repoUrl: `https://github.com/${GITHUB_REPO}`,
+            error: `检查更新失败: ${err.message}`
+          });
+        }
+      }
     }
   ];
+
+  // 公开免密端点与需会话鉴权控制
+  const PUBLIC_PATHS = new Set([
+    '/plugins/dsh-workbuddy2api/auth/me',
+    '/plugins/dsh-workbuddy2api/auth/login',
+    '/plugins/dsh-workbuddy2api/auth/logout',
+    '/plugins/dsh-workbuddy2api/auth/register',
+    '/plugins/dsh-workbuddy2api/public/status'
+  ]);
+  const USER_PATHS = new Set([
+    '/plugins/dsh-workbuddy2api/status',
+    '/plugins/dsh-workbuddy2api/usage',
+    '/plugins/dsh-workbuddy2api/logs',
+    '/plugins/dsh-workbuddy2api/models',
+    '/plugins/dsh-workbuddy2api/playground/chat',
+    '/plugins/dsh-workbuddy2api/user/apikey/reset'
+  ]);
 
   // 构造统一路径分发表，供 Loopback 独立网关与 DSH WebServer 复用
   const routeMap = new Map(routes.map((r) => [r.path, r.handler]));
@@ -869,6 +1380,18 @@ export function registerWebRoutes(ctx, deps) {
     const handler = routeMap.get(pathname);
     if (!handler) return false;
     try {
+      if (userManager && !PUBLIC_PATHS.has(pathname)) {
+        const auth = userManager.checkWebAuth(req);
+        req._wbSessionUser = auth.user;
+        if (!auth.ok) {
+          sendJson(res, 401, { ok: false, authRequired: true, error: '请先登录控制台' });
+          return true;
+        }
+        if (auth.user?.role !== 'admin' && !USER_PATHS.has(pathname)) {
+          sendJson(res, 403, { ok: false, error: '仅管理员可执行此操作' });
+          return true;
+        }
+      }
       await handler(req, res);
     } catch (err) {
       if (!res.headersSent) {
@@ -880,6 +1403,13 @@ export function registerWebRoutes(ctx, deps) {
 
   if (loopback) {
     loopback.setPluginRouterHandler(handlePluginRoute);
+    loopback.setPortalHandler(async (_req, res) => {
+      if (!res.headersSent) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      }
+      res.end(renderPortalHtml({ port: loopback.actualPort || loopback.preferredPort, version: SERVICE_VERSION }));
+      return true;
+    });
     loopback.setDashboardHandler(async (_req, res) => {
       if (!res.headersSent) {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

@@ -3,6 +3,7 @@
  */
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import {
   CN_CHAT_BASE,
   CN_BILLING_BASE,
@@ -18,9 +19,11 @@ import {
   ErrKind,
   parseCreditMultiplier
 } from '../constants.js';
-import { prepareOutboundPayload } from './payload.js';
+import { prepareOutboundPayload, DEGRADED_SYSTEM_PROMPT } from './payload.js';
 import { prepareMessagesWithVision } from './vision.js';
 import { isVideoModel, executeVideoChatBridge } from './video.js';
+import { isInvalidImageData, isModelBlockedBody } from './hint.js';
+import { ModelCatalogEnricher } from './model-catalog.js';
 
 const CLIENT_VERSION = '5.5.4';
 const CLI_VERSION = '2.137.1';
@@ -35,9 +38,31 @@ function isValidHexTrace(s) {
 
 export class UpstreamClient {
   constructor(options = {}) {
+    this.configStore = options.configStore || null;
     this.proxy = options.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
     this.customUA = options.userAgent || '';
     this.onTokenRefresh = options.onTokenRefresh || null;
+    this.deviceTokenPath = options.deviceTokenPath || process.env.WB_DEVICE_TOKEN_FILE || '';
+    this._deviceTokenCache = { path: '', token: '', readAt: 0 };
+    this.modelCatalog = options.modelCatalog || new ModelCatalogEnricher({ dshHome: options.dshHome });
+  }
+
+  readDeviceToken() {
+    const filePath = String(this.configStore?.get('deviceTokenPath') || this.deviceTokenPath || '').trim();
+    if (!filePath) return '';
+    const now = Date.now();
+    if (this._deviceTokenCache.path === filePath && now - this._deviceTokenCache.readAt < 5 * 60 * 1000) {
+      return this._deviceTokenCache.token;
+    }
+    let token = '';
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.isFile() && stat.size > 0 && stat.size <= 1024) {
+        token = fs.readFileSync(filePath, 'utf8').trim();
+      }
+    } catch (_) {}
+    this._deviceTokenCache = { path: filePath, token, readAt: now };
+    return token;
   }
 
   getChatBase(account) {
@@ -125,6 +150,11 @@ export class UpstreamClient {
       headers['X-B3-TraceId'] = b3Trace;
       headers['X-B3-SpanId'] = msgId.slice(0, 16);
       headers['X-B3-Sampled'] = '1';
+
+      const devTok = this.readDeviceToken();
+      if (devTok) {
+        headers['X-Device-Token'] = devTok;
+      }
     }
 
     return headers;
@@ -134,7 +164,8 @@ export class UpstreamClient {
    * 错误归类逻辑
    */
   classifyError(status, bodyText) {
-    const text = (bodyText || '').toLowerCase();
+    const raw = typeof bodyText === 'string' ? bodyText : JSON.stringify(bodyText || '');
+    const text = raw.toLowerCase();
     if (status === 401 || text.includes('12153') || text.includes('token expired') || text.includes('session dead')) {
       return ErrKind.SESSION_DEAD;
     }
@@ -143,6 +174,12 @@ export class UpstreamClient {
     }
     if (status === 429 || text.includes('6004') || text.includes('rate limit') || text.includes('frequency')) {
       return ErrKind.SOFT_RATE;
+    }
+    if (isInvalidImageData(text) || text.includes('image_invalid') || text.includes('invalid image')) {
+      return ErrKind.IMAGE_INVALID;
+    }
+    if (isModelBlockedBody(text) || status === 404) {
+      return ErrKind.MODEL_BLOCKED;
     }
     if (text.includes('11128') || text.includes('content') || text.includes('sensitive') || text.includes('violation')) {
       return ErrKind.CONTENT_BLOCKED;
@@ -391,6 +428,10 @@ export class UpstreamClient {
         : (item.reasoning?.effort ? [item.reasoning.effort] : (item.supportedEfforts || []));
       const defaultEffort = item.reasoning?.defaultEffort || item.reasoning?.effort || '';
 
+      const rawCtx = Number(item.maxInputTokens || item.maxAllowedSize || item.contextWindow || item.context_length || 0);
+      const rawMax = Number(item.maxOutputTokens || item.maxTokens || 0);
+      const limits = this.modelCatalog.lookupLimits(bare, rawCtx, rawMax);
+
       models.push({
         id: fullId,
         bareId: bare,
@@ -409,8 +450,8 @@ export class UpstreamClient {
         supportsReasoning: Boolean(item.supportsReasoning),
         supportsToolCall: Boolean(item.supportsToolCall ?? true),
         onlyReasoning: Boolean(item.onlyReasoning),
-        contextWindow: Number(item.maxInputTokens || item.maxAllowedSize || item.contextWindow || item.context_length || 200000),
-        maxTokens: Number(item.maxOutputTokens || item.maxTokens || 32000),
+        contextWindow: limits.contextWindow,
+        maxTokens: limits.maxTokens,
         supportedEfforts,
         defaultEffort
       });
@@ -533,7 +574,7 @@ export class UpstreamClient {
       // 若遇到内容策略 / 11128 拦截，自动使用中性精简 System Prompt 进行降级自愈重试一次
       if (kind === ErrKind.CONTENT_BLOCKED || res.status === 403) {
         const degradedMsgs = upstreamBody.messages.map((m) =>
-          m.role === 'system' ? { ...m, content: 'You are a helpful AI coding assistant.' } : m
+          m.role === 'system' ? { ...m, content: DEGRADED_SYSTEM_PROMPT } : m
         );
         const degradedBody = { ...upstreamBody, messages: degradedMsgs };
         try {
@@ -546,6 +587,7 @@ export class UpstreamClient {
           if (degRes.ok) {
             return {
               ok: true,
+              degradedTriggered: true,
               status: degRes.status,
               response: degRes,
               bodyStream: degRes.body

@@ -29,7 +29,19 @@ import { isVideoModel } from '../src/upstream/video.js';
 import { createWorkBuddyAdapter } from '../src/adapter/pi-ai-adapter.js';
 import { runTravelForAccount, getBuddyInfo, getTravelStatus } from '../src/upstream/travel.js';
 import { getYesterdayDateCST, reportActiveChat, getStreak } from '../src/upstream/growth.js';
-import { prepareOutboundPayload } from '../src/upstream/payload.js';
+import {
+  prepareOutboundPayload,
+  repackToolResultBlocks,
+  cleanupOrphanToolMessages,
+  dropTruncatedToolCalls,
+  pruneOldestHistory
+} from '../src/upstream/payload.js';
+import { getGatewayHint, parseQuotaResetAt } from '../src/upstream/hint.js';
+import { checkIPWhitelist, parseWhitelistEntries } from '../src/server/ip-whitelist.js';
+import { UserManager } from '../src/server/auth-users.js';
+import { AlertManager } from '../src/server/alerts.js';
+import { renderConsoleHtml, renderPortalHtml } from '../src/server/dashboard-html.js';
+import vm from 'node:vm';
 
 console.log('🧪 开始执行 WorkBuddy 2API 自动化冒烟测试...\n');
 
@@ -520,4 +532,182 @@ schedRate.stopAutoRoutines();
 fs.rmSync(tmpHome2, { recursive: true, force: true });
 console.log('   ✓ 模型真实倍率解析、实测扣费记账、裸模型名透出与快过期优先调度全部通过');
 
-console.log('\n🎉 所有 18 项自动化全功能验证测试全部通过！');
+// 19. 测试 Tool Call 深度容错（插队重排 / 对称孤儿清理 / 截断丢弃 / 历史裁剪 / Gateway Hint）
+console.log('19. 测试 Tool Call 重排、对称孤儿清理、残缺参数过滤与 Gateway Hint...');
+const interleavedMsgs = [
+  {
+    role: 'assistant',
+    tool_calls: [
+      { id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } },
+      { id: 'c2', type: 'function', function: { name: 'ls', arguments: '{}' } }
+    ]
+  },
+  { role: 'tool', tool_call_id: 'c1', content: 'ok1' },
+  { role: 'user', content: 'image resize notice injected between tool outputs' },
+  { role: 'tool', tool_call_id: 'c2', content: 'ok2' }
+];
+const repacked = repackToolResultBlocks(interleavedMsgs);
+assert.strictEqual(repacked[1].role, 'tool');
+assert.strictEqual(repacked[2].role, 'tool');
+assert.strictEqual(repacked[3].role, 'user', '插队消息必须被挪到本组 parallel tool 结果之后');
+
+const asymMsgs = [
+  {
+    role: 'assistant',
+    tool_calls: [
+      { id: 'c1', type: 'function', function: { name: 'a', arguments: '{}' } },
+      { id: 'c2', type: 'function', function: { name: 'b', arguments: '{}' } }
+    ]
+  },
+  { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+  { role: 'tool', tool_call_id: 'orphan-x', content: 'orphan' }
+];
+const symCleaned = cleanupOrphanToolMessages(asymMsgs);
+assert.strictEqual(symCleaned.length, 2, '无调用方的孤儿 tool 必须删除');
+assert.strictEqual(symCleaned[0].tool_calls.length, 1, '无结果配对的 assistant tool_call (c2) 也必须对称删除');
+assert.strictEqual(symCleaned[0].tool_calls[0].id, 'c1');
+
+const keptCalls = dropTruncatedToolCalls([
+  { id: 'ok1', function: { name: 'ping', arguments: '' } },
+  { id: 'ok2', function: { name: 'calc', arguments: '{"a":1}' } },
+  { id: 'bad3', function: { name: 'edit', arguments: '{"path":"/tmp/' } }
+]);
+assert.strictEqual(keptCalls.length, 2, '空参工具与合法JSON应保留，半截残缺JSON工具调用必须丢弃');
+
+const prunedRes = pruneOldestHistory({
+  messages: [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'turn1' },
+    { role: 'assistant', content: 'ans1' },
+    { role: 'user', content: 'turn2' }
+  ]
+});
+assert.ok(prunedRes.pruned && prunedRes.payload.messages.length === 2 && prunedRes.payload.messages[1].content === 'turn2');
+
+const hintImg = getGatewayHint(ErrKind.BAD_PARAMS, '{"code":11133,"msg":"model_param_invalid"}', {
+  model: 'deepseek-v4',
+  hasImage: true,
+  modelInCatalog: true,
+  modelSupportsImages: false
+});
+assert.ok(hintImg.includes('does not support images'));
+assert.ok(getGatewayHint(ErrKind.WAF_BLOCK, '').includes('WAF'));
+console.log('   ✓ Tool Call 深度容错、上下文自动裁剪与 Gateway Hint 验证通过');
+
+// 20. 测试 auto-free 多模型顺延故障转移、免费额度 Quota 墙钟锁定、WAF IP 止损与控制台 HTML 语法校验
+console.log('20. 测试 auto-free 跨免费模型自动切换、Quota 锁定与 WAF IP 止损...');
+const tmpHome3 = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-parity-'));
+const cfg3 = new ConfigStore({ freeModels: ['global:hy4free', 'cn:hy4free'], autoFreeEnabled: true }, { dshHome: tmpHome3 });
+const store3 = new AccountStore({ dshHome: tmpHome3, skipDiscovery: true });
+store3.upsert({ account: { uid: 'acc-gl', nickname: 'GL' }, auth: { realm: 'global', accessToken: 't1', refreshToken: 'r1' } });
+store3.upsert({ account: { uid: 'acc-cn', nickname: 'CN' }, auth: { realm: 'cn', accessToken: 't2', refreshToken: 'r2' } });
+const ledger3 = new UsageLedger({ dshHome: tmpHome3 });
+const sched3 = new Scheduler(store3, { configStore: cfg3 });
+let triedModels = [];
+const mockFailoverClient = {
+  async chatStream(account, reqBody) {
+    triedModels.push(`${account.auth.realm}:${reqBody.model}`);
+    if (reqBody.model.includes('hy4free') && account.auth.realm === 'global') {
+      return { ok: false, status: 429, kind: ErrKind.SOFT_RATE, message: '{"code":6004,"msg":"rate limited"}' };
+    }
+    const enc = new TextEncoder();
+    const sse =
+      'data: {"id":"1","choices":[{"delta":{"content":"fallback-ok"}}],"usage":{"prompt_tokens":5,"completion_tokens":5,"quota":{"percent":100,"reset_at":"2099-01-01T00:00:00Z","shared_models":["hy3"]}}}\n\ndata: [DONE]\n\n';
+    return {
+      ok: true,
+      status: 200,
+      bodyStream: new ReadableStream({
+        start(ctrl) {
+          ctrl.enqueue(enc.encode(sse));
+          ctrl.close();
+        }
+      })
+    };
+  },
+  classifyError: () => ErrKind.NONE,
+  async fetchModels() { return []; }
+};
+const gw3 = new LoopbackGateway(sched3, mockFailoverClient, ledger3, { configStore: cfg3, port: 0 });
+const p3 = await gw3.start();
+const foRes = await fetch(`http://127.0.0.1:${p3}/v1/chat/completions`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ model: 'auto-free', stream: false, messages: [{ role: 'user', content: 'hi' }] })
+});
+assert.strictEqual(foRes.status, 200);
+const foJson = await foRes.json();
+assert.strictEqual(foJson.choices[0].message.content, 'fallback-ok', 'global:hy4free 429 应自动回落下一个可用候选/域');
+assert.ok(sched3.isCoolingDown('acc-cn', 'hy4free') || sched3.isCoolingDown('acc-cn', 'hy3'), 'usage.quota.percent>=100 后应对免费模型及 shared_models 墙钟锁定');
+
+// 测试管理员 /admin/accounts/:uid/disable|enable|revive 及 /healthz + /status
+const admDis = await fetch(`http://127.0.0.1:${p3}/admin/accounts/acc-gl/disable`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'ops_maint' })
+});
+const admDisJson = await admDis.json();
+assert.strictEqual(admDisJson.manual_disabled, true);
+const hzRes = await fetch(`http://127.0.0.1:${p3}/healthz`);
+assert.strictEqual(hzRes.status, 200);
+assert.strictEqual(hzRes.headers.get('x-service'), 'dsh-workbuddy2api');
+const stRes3 = await fetch(`http://127.0.0.1:${p3}/status`);
+const stJson3 = await stRes3.json();
+assert.strictEqual(stJson3.manual_disabled, 1);
+
+// 验证控制台与门户页面渲染及内联 JS 语法零错误
+const consoleHtml = renderConsoleHtml({ port: p3 });
+const portalHtml = renderPortalHtml({ port: p3 });
+const scriptMatch = consoleHtml.match(/<script>([\s\S]*?)<\/script>/);
+assert.ok(scriptMatch && portalHtml.includes('PORTAL'), 'Console 与 Portal HTML 应正常生成');
+new vm.Script(scriptMatch[1]);
+
+gw3.stop();
+sched3.stopAutoRoutines();
+fs.rmSync(tmpHome3, { recursive: true, force: true });
+console.log('   ✓ auto-free 顺延故障转移、Quota 锁定、/healthz /status /admin 与控制台 JS 编译全部通过');
+
+// 21. 测试 IP/CIDR 白名单、多租户用户配额/RPM 与 Webhook 多格式告警分发
+console.log('21. 测试 IP/CIDR 白名单、多租户配额/RPM 与 Webhook 告警...');
+const tmpHome4 = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-sec-'));
+const cfg4 = new ConfigStore({
+  webPassword: 'secret-pass',
+  alerts: { enabled: true, webhooks: ['https://open.feishu.cn/open-apis/bot/v2/hook/test'], events: ['ban', 'cooling'], minCredit: 50 }
+}, { dshHome: tmpHome4 });
+const wlParsed = parseWhitelistEntries(['192.168.10.0/24', '10.0.0.5']);
+assert.strictEqual(wlParsed.normalized.length, 2);
+const allowRes = checkIPWhitelist(
+  { socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '192.168.10.88' } },
+  { enabled: true, allowedIPs: wlParsed.normalized, allowLocalhost: false }
+);
+assert.strictEqual(allowRes.allowed, true, '经可信代理透传的白名单网段 IP 应放行');
+const denyRes = checkIPWhitelist(
+  { socket: { remoteAddress: '8.8.8.8' }, headers: { 'x-forwarded-for': '192.168.10.88' } },
+  { enabled: true, allowedIPs: wlParsed.normalized, allowLocalhost: false }
+);
+assert.strictEqual(denyRes.allowed, false, '公网直连伪造 X-Forwarded-For 不得绕过 IP 白名单');
+
+const um4 = new UserManager({ configStore: cfg4, dshHome: tmpHome4 });
+assert.strictEqual(um4.hasWebPassword(), true);
+const authAdmin = um4.authenticate('admin', 'secret-pass', '127.0.0.1');
+assert.ok(authAdmin.token && authAdmin.user.role === 'admin');
+const tenant = um4.createUser({ username: 'alice', password: 'pw1234', role: 'user', dailyCreditLimit: 5, rpm: 2 });
+assert.strictEqual(um4.verifyApiRequest(tenant.apiKey, '').ok, true);
+assert.strictEqual(um4.verifyApiRequest(tenant.apiKey, '').ok, true);
+const rpmBlocked = um4.verifyApiRequest(tenant.apiKey, '');
+assert.strictEqual(rpmBlocked.status, 429, '超出 RPM 上限必须被拦截');
+um4.deductUserCredit(tenant, 5);
+const quotaBlocked = um4.verifyApiRequest(tenant.apiKey, '');
+assert.strictEqual(quotaBlocked.status, 429, '超过日积分上限必须被拦截');
+
+let hookPayloads = [];
+const alertMgr4 = new AlertManager({
+  configStore: cfg4,
+  fetchFn: async (_u, opts) => {
+    hookPayloads.push(JSON.parse(opts.body));
+    return { ok: true, status: 200 };
+  }
+});
+const alertRes = await alertMgr4.sendTestAlert();
+assert.ok(alertRes.ok && hookPayloads[0].msg_type === 'text', '飞书 Webhook 格式必须正确编码');
+fs.rmSync(tmpHome4, { recursive: true, force: true });
+console.log('   ✓ IP/CIDR 白名单防伪造、多租户 RPM/日限额与 Webhook 告警测试通过');
+
+console.log('\n🎉 所有 21 项自动化全功能验证测试全部通过！');

@@ -121,11 +121,13 @@ export class UsageLedger {
         credit: 0,
         cacheHits: 0,
         models: {},
+        modelStats: {},
         hours: {}
       };
     }
 
     const day = this.data.days[today];
+    if (!day.modelStats) day.modelStats = {};
     day.requests += 1;
     day.inputTokens += inTok;
     day.outputTokens += outTok;
@@ -140,35 +142,40 @@ export class UsageLedger {
     day.hours[hour].tokens += inTok + outTok;
     day.hours[hour].credit = round3((day.hours[hour].credit || 0) + credit);
 
+    const updateBucket = (bucket) => {
+      bucket.requests += 1;
+      if (success) bucket.success += 1;
+      else bucket.failed += 1;
+      bucket.inputTokens += inTok;
+      bucket.outputTokens += outTok;
+      bucket.cacheHitTokens += cacheHitTokens;
+      bucket.cacheMissTokens += cacheMissTokens;
+      bucket.cacheWriteTokens += cacheWriteTokens;
+      if (hasCredit) {
+        bucket.credit = round3((bucket.credit || 0) + credit);
+        bucket.creditSamples = (bucket.creditSamples || 0) + 1;
+      }
+      if (ttfbMs > 0) {
+        bucket.ttfbSumMs += ttfbMs;
+        bucket.ttfbCount += 1;
+      }
+      if (durationMs > 0) {
+        bucket.latSumMs += durationMs;
+        const genMs = durationMs > ttfbMs ? durationMs - ttfbMs : durationMs;
+        if (outTok > 0 && genMs > 0) {
+          bucket.genSecSum += genMs / 1000;
+        }
+      }
+      bucket.lastSeen = Date.now();
+      return bucket;
+    };
+
+    const mKey = String(model || 'unknown');
+    day.modelStats[mKey] = updateBucket(day.modelStats[mKey] || createEmptyModelBucket());
+
     // 持久化模型级聚合指标
     if (!this.data.modelStats) this.data.modelStats = {};
-    const mKey = String(model || 'unknown');
-    const bucket = this.data.modelStats[mKey] || createEmptyModelBucket();
-    bucket.requests += 1;
-    if (success) bucket.success += 1;
-    else bucket.failed += 1;
-    bucket.inputTokens += inTok;
-    bucket.outputTokens += outTok;
-    bucket.cacheHitTokens += cacheHitTokens;
-    bucket.cacheMissTokens += cacheMissTokens;
-    bucket.cacheWriteTokens += cacheWriteTokens;
-    if (hasCredit) {
-      bucket.credit = round3((bucket.credit || 0) + credit);
-      bucket.creditSamples = (bucket.creditSamples || 0) + 1;
-    }
-    if (ttfbMs > 0) {
-      bucket.ttfbSumMs += ttfbMs;
-      bucket.ttfbCount += 1;
-    }
-    if (durationMs > 0) {
-      bucket.latSumMs += durationMs;
-      const genMs = durationMs > ttfbMs ? durationMs - ttfbMs : durationMs;
-      if (outTok > 0 && genMs > 0) {
-        bucket.genSecSum += genMs / 1000;
-      }
-    }
-    bucket.lastSeen = Date.now();
-    this.data.modelStats[mKey] = bucket;
+    this.data.modelStats[mKey] = updateBucket(this.data.modelStats[mKey] || createEmptyModelBucket());
 
     // 全局汇总
     this.data.summary.totalRequests += 1;
@@ -220,55 +227,22 @@ export class UsageLedger {
     return [...this.recentLogs];
   }
 
-  getStats(modelCatalogMap = null) {
+  getAvailableDates() {
     const today = this.getTodayKey();
-    const todayData = this.data.days[today] || {
-      requests: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      credit: 0,
-      cacheHits: 0,
-      hours: {},
-      models: {}
-    };
+    const keys = Object.keys(this.data.days || {});
+    if (!keys.includes(today)) keys.push(today);
+    return keys.sort().reverse();
+  }
 
-    const dates = [];
-    const now = new Date();
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 86400000);
-      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      const item = this.data.days[k] || { requests: 0, inputTokens: 0, outputTokens: 0, credit: 0, cacheHits: 0 };
-      const totalTokens = item.inputTokens + item.outputTokens;
-      const hitRate = item.requests > 0 ? Math.round(((item.cacheHits || 0) / item.requests) * 100) : 0;
-      dates.push({
-        date: k.slice(5),
-        requests: item.requests,
-        tokens: totalTokens,
-        credit: round3(item.credit || 0),
-        hitRate
-      });
-    }
-
-    const hourly = [];
-    for (let h = 0; h < 24; h++) {
-      const sh = String(h);
-      hourly.push({
-        hour: `${sh}时`,
-        tokens: todayData.hours?.[sh]?.tokens || 0,
-        requests: todayData.hours?.[sh]?.requests || 0,
-        credit: round3(todayData.hours?.[sh]?.credit || 0)
-      });
-    }
-
-    const modelBreakdown = [];
-    const rawModelStats = this.data.modelStats || {};
-    for (const [modelId, st] of Object.entries(rawModelStats)) {
+  _buildBreakdown(rawModelStats = {}, modelCatalogMap = null) {
+    const list = [];
+    for (const [modelId, st] of Object.entries(rawModelStats || {})) {
       const totalTok = (st.inputTokens || 0) + (st.outputTokens || 0);
       const hitDenom = (st.cacheHitTokens || 0) + (st.cacheMissTokens || 0);
       const cacheHitRate = hitDenom > 0 ? Math.round(((st.cacheHitTokens || 0) / hitDenom) * 100) : 0;
       const meta = modelCatalogMap?.get(modelId) || modelCatalogMap?.get(`global:${modelId}`) || modelCatalogMap?.get(`cn:${modelId}`);
 
-      modelBreakdown.push({
+      list.push({
         model: modelId,
         rate: meta?.rate || '-',
         multiplier: meta?.multiplier ?? null,
@@ -291,16 +265,68 @@ export class UsageLedger {
         lastSeen: st.lastSeen || 0
       });
     }
-    modelBreakdown.sort((a, b) => b.requests - a.requests);
+    list.sort((a, b) => b.requests - a.requests);
+    return list;
+  }
+
+  getStats(modelCatalogMap = null, targetDate = '') {
+    const today = this.getTodayKey();
+    const activeDate = targetDate && this.data.days[targetDate] ? targetDate : today;
+    const dayData = this.data.days[activeDate] || {
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      credit: 0,
+      cacheHits: 0,
+      hours: {},
+      models: {},
+      modelStats: {}
+    };
+
+    const dates = [];
+    const now = new Date();
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 86400000);
+      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const item = this.data.days[k] || { requests: 0, inputTokens: 0, outputTokens: 0, credit: 0, cacheHits: 0 };
+      const totalTokens = item.inputTokens + item.outputTokens;
+      const hitRate = item.requests > 0 ? Math.round(((item.cacheHits || 0) / item.requests) * 100) : 0;
+      dates.push({
+        date: k.slice(5),
+        fullDate: k,
+        requests: item.requests,
+        tokens: totalTokens,
+        credit: round3(item.credit || 0),
+        hitRate
+      });
+    }
+
+    const hourly = [];
+    for (let h = 0; h < 24; h++) {
+      const sh = String(h);
+      hourly.push({
+        hour: `${sh}时`,
+        tokens: dayData.hours?.[sh]?.tokens || 0,
+        requests: dayData.hours?.[sh]?.requests || 0,
+        credit: round3(dayData.hours?.[sh]?.credit || 0)
+      });
+    }
+
+    // 若指定了历史日期则按该日统计返回，否则返回全量累计模型 Breakdown
+    const modelBreakdown = targetDate
+      ? this._buildBreakdown(dayData.modelStats || {}, modelCatalogMap)
+      : this._buildBreakdown(this.data.modelStats || {}, modelCatalogMap);
 
     return {
+      activeDate,
+      availableDates: this.getAvailableDates(),
       today: {
-        requests: todayData.requests,
-        inputTokens: todayData.inputTokens,
-        outputTokens: todayData.outputTokens,
-        totalTokens: todayData.inputTokens + todayData.outputTokens,
-        credit: round3(todayData.credit || 0),
-        models: todayData.models
+        requests: dayData.requests,
+        inputTokens: dayData.inputTokens,
+        outputTokens: dayData.outputTokens,
+        totalTokens: dayData.inputTokens + dayData.outputTokens,
+        credit: round3(dayData.credit || 0),
+        models: dayData.models
       },
       summary: this.data.summary,
       trend7d: dates,

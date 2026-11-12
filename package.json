@@ -1,6 +1,6 @@
 {
   "name": "dsh-workbuddy2api",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "displayName": "DSH WorkBuddy2API Connect & Gateway",
   "description": "将 WorkBuddy / CodeBuddy 多账号高可用调度网关无缝接入 DeepSeek Harness (DSH) — 具备多账号池轮转、双域调度、全模型兼容、智能免密路由、全模态视觉、自动签到福利与本地 OpenAI 兼容网关",
   "type": "module",

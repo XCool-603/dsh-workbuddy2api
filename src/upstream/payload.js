@@ -124,31 +124,174 @@ export function sanitizeAndNormalizeMessages(messages, realm) {
 }
 
 /**
- * 清理孤儿 tool 调用/结果，避免上游返回 400 工具配对异常
+ * 重排并行 tool_calls 后被插队的非 tool 消息（对标 tool_pairing.go repackToolResultBlocks）
+ * 避免客户端插入系统/状态/图片提示在 assistant.tool_calls 与其 tool 结果之间引发上游 11148 配对报错
+ */
+export function repackToolResultBlocks(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const out = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const m = messages[i];
+    out.push(m);
+    i++;
+
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.tool_calls) || m.tool_calls.length === 0) {
+      continue;
+    }
+
+    const expectedIds = new Set(m.tool_calls.map((tc) => tc?.id).filter(Boolean));
+    if (expectedIds.size === 0) continue;
+
+    const results = [];
+    const between = [];
+    while (i < messages.length && results.length < expectedIds.size) {
+      const cur = messages[i];
+      if (!cur || typeof cur !== 'object') {
+        between.push(cur);
+        i++;
+        continue;
+      }
+      if (cur.role === 'tool') {
+        results.push(cur);
+        i++;
+        continue;
+      }
+      if (results.length === 0) {
+        break;
+      }
+      if (cur.role === 'assistant' && Array.isArray(cur.tool_calls) && cur.tool_calls.length > 0) {
+        break;
+      }
+      between.push(cur);
+      i++;
+    }
+    out.push(...results, ...between);
+  }
+  return out;
+}
+
+/**
+ * 清理孤儿 tool 调用/结果（双侧对称裁剪 callIDs ∩ resultIDs，对标 cleanupOrphanToolCalls）
+ * 同时删除无结果配对的 assistant.tool_calls 与无调用方配对的 role:tool 消息
  */
 export function cleanupOrphanToolMessages(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return messages;
 
-  const validToolCallIds = new Set();
-  const resolvedToolResultIds = new Set();
+  const callIds = new Set();
+  const resultIds = new Set();
 
   for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
     if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
       for (const tc of m.tool_calls) {
-        if (tc?.id) validToolCallIds.add(tc.id);
+        if (tc?.id) callIds.add(tc.id);
       }
-    }
-    if (m.role === 'tool' && m.tool_call_id) {
-      resolvedToolResultIds.add(m.tool_call_id);
+    } else if (m.role === 'tool' && m.tool_call_id) {
+      resultIds.add(m.tool_call_id);
     }
   }
 
-  return messages.filter((m) => {
-    if (m.role === 'tool' && m.tool_call_id) {
-      return validToolCallIds.has(m.tool_call_id);
+  if (callIds.size === 0 && resultIds.size === 0) return messages;
+
+  const keepCalls = new Set();
+  for (const id of callIds) {
+    if (resultIds.has(id)) keepCalls.add(id);
+  }
+
+  const cleaned = [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') {
+      cleaned.push(m);
+      continue;
     }
+    if (m.role === 'tool') {
+      if (m.tool_call_id && keepCalls.has(m.tool_call_id)) {
+        cleaned.push(m);
+      }
+      continue;
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const keptCalls = m.tool_calls.filter((tc) => tc?.id && keepCalls.has(tc.id));
+      if (keptCalls.length === m.tool_calls.length) {
+        cleaned.push(m);
+      } else {
+        const nextMsg = { ...m };
+        if (keptCalls.length > 0) {
+          nextMsg.tool_calls = keptCalls;
+        } else {
+          delete nextMsg.tool_calls;
+          if (!nextMsg.content) nextMsg.content = '';
+        }
+        cleaned.push(nextMsg);
+      }
+      continue;
+    }
+    cleaned.push(m);
+  }
+  return cleaned;
+}
+
+/**
+ * 判定流式被截断的工具调用 arguments（空串合法；非空但非合法 JSON 为截断）
+ */
+export function isTruncatedArguments(raw) {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) return false;
+  try {
+    JSON.parse(trimmed);
+    return false;
+  } catch (_) {
     return true;
+  }
+}
+
+/**
+ * 过滤 arguments 残缺的 tool_calls，避免客户端反序列化崩溃
+ */
+export function dropTruncatedToolCalls(calls = []) {
+  if (!Array.isArray(calls)) return [];
+  return calls.filter((c) => {
+    if (!c?.function) return true;
+    return !isTruncatedArguments(c.function.arguments);
   });
+}
+
+export const DEGRADED_SYSTEM_PROMPT =
+  "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise.";
+
+/**
+ * 在 11115 上下文超限时，自动修剪最早一轮对话 (user + assistant/tool...) 保留首部 system 与近期轮次
+ */
+export function pruneOldestHistory(payload) {
+  if (!payload || !Array.isArray(payload.messages) || payload.messages.length <= 2) {
+    return { pruned: false, payload };
+  }
+  const msgs = payload.messages;
+  let firstNonSystem = 0;
+  while (firstNonSystem < msgs.length) {
+    const r = String(msgs[firstNonSystem]?.role || '').toLowerCase();
+    if (r !== 'system' && r !== 'developer') break;
+    firstNonSystem++;
+  }
+  if (firstNonSystem >= msgs.length - 1) {
+    return { pruned: false, payload };
+  }
+  let nextTurn = firstNonSystem + 1;
+  while (nextTurn < msgs.length - 1) {
+    const r = String(msgs[nextTurn]?.role || '').toLowerCase();
+    if (r === 'user') break;
+    nextTurn++;
+  }
+  if (nextTurn >= msgs.length) {
+    return { pruned: false, payload };
+  }
+  const nextMsgs = [...msgs.slice(0, firstNonSystem), ...msgs.slice(nextTurn)];
+  return {
+    pruned: true,
+    payload: { ...payload, messages: nextMsgs }
+  };
 }
 
 /**
@@ -258,8 +401,9 @@ export function prepareOutboundPayload(reqBody, preparedMessages, { realm, uid, 
   // 1. 翻译 max_completion_tokens
   translateMaxCompletionTokens(obj);
 
-  // 2. 消息角色归一 + 视觉已处理内容 + 黑名单指纹脱敏 + 孤儿 tool 清理
+  // 2. 消息角色归一 + 视觉已处理内容 + 黑名单指纹脱敏 + tool 重排 + 对称孤儿 tool 清理
   let msgs = sanitizeAndNormalizeMessages(preparedMessages, realm);
+  msgs = repackToolResultBlocks(msgs);
   msgs = cleanupOrphanToolMessages(msgs);
   obj.messages = msgs;
 

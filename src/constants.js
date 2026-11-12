@@ -41,9 +41,12 @@ export const PROVIDER_NAME = 'workbuddy';
 export const PROVIDER_ALIAS = 'workbuddy2api';
 export const SETTINGS_NS = 'settings.workbuddy2api';
 export const SIDEBAR_PANEL_ID = 'workbuddy2api-panel';
+export const SERVICE_VERSION = '1.2.0';
+export const GITHUB_REPO = 'XCool-603/dsh-workbuddy2api';
 
 export const DEFAULT_GATEWAY_PORT = 7863;
 export const DEFAULT_IDLE_TIMEOUT_MS = 300000;
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 90000;
 export const SSE_PING_INTERVAL_MS = 3000;
 
 /** 错误分类枚举 */
@@ -53,6 +56,8 @@ export const ErrKind = {
   SOFT_RATE: 'soft_rate',
   SESSION_DEAD: 'session_dead',
   NOT_FOUND: 'not_found',
+  MODEL_BLOCKED: 'model_blocked',
+  IMAGE_INVALID: 'image_invalid',
   SERVER: 'server',
   CONTENT_BLOCKED: 'content_blocked',
   BAD_PARAMS: 'bad_params',

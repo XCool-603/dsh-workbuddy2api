@@ -5,9 +5,12 @@
 import http from 'node:http';
 import {
   DEFAULT_GATEWAY_PORT,
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  SERVICE_VERSION,
   STATIC_MODELS,
   DEFAULT_MODEL_ALIASES,
-  VIDEO_GENERATIONS_PATH
+  VIDEO_GENERATIONS_PATH,
+  ErrKind
 } from '../constants.js';
 import { writeSSEHeaders, createSSELinePump, formatOpenAIChunk } from './sse.js';
 import {
@@ -20,6 +23,19 @@ import {
   chatCompletionToResponseObject,
   createResponsesStreamEmitter
 } from './responses.js';
+import {
+  dropTruncatedToolCalls,
+  pruneOldestHistory,
+  DEGRADED_SYSTEM_PROMPT
+} from '../upstream/payload.js';
+import {
+  getGatewayHint,
+  NO_HEALTHY_ACCOUNT_HINT,
+  injectFrameGatewayHint,
+  parseQuotaResetAt,
+  requestHasImagePart
+} from '../upstream/hint.js';
+import { checkIPWhitelist } from './ip-whitelist.js';
 
 function readJsonBody(req, res, maxBytes = 25 * 1024 * 1024) {
   return new Promise((resolve) => {
@@ -89,7 +105,10 @@ export class LoopbackGateway {
     this.enabledModels = new Set(options.enabledModels || []);
 
     this.dashboardHandler = options.dashboardHandler || null;
+    this.portalHandler = options.portalHandler || null;
     this.pluginRouterHandler = options.pluginRouterHandler || null;
+    this.userManager = options.userManager || null;
+    this.alertManager = options.alertManager || null;
 
     this.discoveredModels = [];
     this.lastModelFetchAt = 0;
@@ -104,6 +123,10 @@ export class LoopbackGateway {
     this.dashboardHandler = fn;
   }
 
+  setPortalHandler(fn) {
+    this.portalHandler = fn;
+  }
+
   setPluginRouterHandler(fn) {
     this.pluginRouterHandler = fn;
   }
@@ -113,12 +136,17 @@ export class LoopbackGateway {
     return {
       apiKey: cfg.apiKey ?? this.apiKey ?? '',
       aliases: { ...DEFAULT_MODEL_ALIASES, ...(this.modelAliases || {}), ...(cfg.aliases || {}) },
+      modelRoutes: cfg.modelRoutes && typeof cfg.modelRoutes === 'object' ? cfg.modelRoutes : {},
+      autoFreeEnabled: cfg.autoFreeEnabled !== false,
+      portalAsHome: Boolean(cfg.portalAsHome),
       enabledModels: Array.isArray(cfg.enabledModels) ? cfg.enabledModels : [...this.enabledModels],
       freeModels: Array.isArray(cfg.freeModels) && cfg.freeModels.length > 0
         ? cfg.freeModels
         : ['global:hy4free', 'cn:hy4free', 'global:hy3', 'cn:hy3', 'global:deepseek-v4.1-flash-sg'],
       promptMode: cfg.promptMode || 'none',
-      promptText: cfg.promptText || ''
+      promptText: cfg.promptText || '',
+      streamIdleTimeoutMs: Math.max(10000, Number(cfg.streamIdleTimeoutMs || DEFAULT_STREAM_IDLE_TIMEOUT_MS)),
+      ipWhitelist: cfg.ipWhitelist || { enabled: false, allowedIPs: [], allowLocalhost: true }
     };
   }
 
@@ -133,20 +161,97 @@ export class LoopbackGateway {
     return map;
   }
 
-  checkAuth(req, url) {
-    const { apiKey } = this._getRuntimeConfig();
-    if (!apiKey) return true;
-
+  _extractProvidedApiKey(req, url) {
     const authHeader = String(req.headers['authorization'] || '');
     const bearer = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
     const xKey = String(req.headers['x-api-key'] || '').trim();
     const queryKey = url.searchParams.get('key') || '';
-
-    return bearer === apiKey || xKey === apiKey || queryKey === apiKey;
+    return bearer || xKey || queryKey || '';
   }
 
-  resolveModel(requestedModel) {
-    const { aliases, freeModels } = this._getRuntimeConfig();
+  checkAuth(req, url) {
+    const { apiKey } = this._getRuntimeConfig();
+    const provided = this._extractProvidedApiKey(req, url);
+
+    if (this.userManager) {
+      const verified = this.userManager.verifyApiRequest(provided, apiKey);
+      req._wbUser = verified.user || null;
+      if (!verified.ok) {
+        req._authError = { status: verified.status || 401, message: verified.message };
+        return false;
+      }
+      return true;
+    }
+
+    if (!apiKey) return true;
+    return provided === apiKey;
+  }
+
+  /**
+   * 汇总所有 0 算力免费模型候选并按可用账号健康状态与熔断器优先级排序
+   */
+  getFreeModelCandidates() {
+    const { freeModels, modelRoutes } = this._getRuntimeConfig();
+    const enabledAccs = this.scheduler.store.getAll().filter((a) => !this.scheduler.isAccountUnavailable(a));
+    const enabledRealms = new Set(enabledAccs.map((a) => a.auth?.realm || 'cn'));
+
+    const rawList = [
+      ...(Array.isArray(freeModels) ? freeModels : []),
+      ...(Array.isArray(modelRoutes['auto-free']) ? modelRoutes['auto-free'] : []),
+      ...(Array.isArray(modelRoutes['free']) ? modelRoutes['free'] : []),
+      ...this.discoveredModels.filter((m) => m.isFree).map((m) => m.id),
+      'global:hy4free',
+      'cn:hy4free',
+      'cn:deepseek-v4.1-flash',
+      'global:deepseek-v4.1-flash-sg',
+      'cn:glm-4-flash'
+    ];
+
+    const deduped = [];
+    const seen = new Set();
+    for (const item of rawList) {
+      const m = String(item || '').trim();
+      if (!m || seen.has(m)) continue;
+      seen.add(m);
+      deduped.push(m);
+    }
+
+    return this.sortCandidatesByHealth(deduped, enabledRealms);
+  }
+
+  sortCandidatesByHealth(candidates = [], enabledRealms = null) {
+    const healthyActive = [];
+    const backupNormal = [];
+    const coolingModels = [];
+
+    const accs = this.scheduler.store.getAll().filter((a) => !this.scheduler.isAccountUnavailable(a));
+    const realmsSet = enabledRealms || new Set(accs.map((a) => a.auth?.realm || 'cn'));
+
+    for (const m of candidates) {
+      if (this.scheduler.isRouteModelCooling(m)) {
+        coolingModels.push(m);
+        continue;
+      }
+      const r = m.startsWith('global:') ? 'global' : m.startsWith('cn:') ? 'cn' : null;
+      const bare = m.replace(/^(cn:|global:|solo:|trae:)/i, '');
+      const hasHealthyAcc = accs.some((a) => {
+        const accRealm = a.auth?.realm || 'cn';
+        if (r && accRealm !== r) return false;
+        return !this.scheduler.isCoolingDown(a.account.uid, bare);
+      });
+      if (hasHealthyAcc) {
+        healthyActive.push(m);
+      } else if (!r || realmsSet.size === 0 || realmsSet.has(r)) {
+        backupNormal.push(m);
+      } else {
+        coolingModels.push(m);
+      }
+    }
+    return [...healthyActive, ...backupNormal, ...coolingModels];
+  }
+
+  resolveModelCandidates(requestedModel) {
+    const { aliases, modelRoutes } = this._getRuntimeConfig();
     let target = String(requestedModel || 'auto-free').trim() || 'auto-free';
     const seen = new Set();
 
@@ -155,29 +260,44 @@ export class LoopbackGateway {
       target = aliases[target];
     }
 
-    if (target === 'auto-free') {
-      const enabledRealms = new Set(
-        this.scheduler.store
-          .getAll()
-          .filter((a) => !a.disabled && !this.scheduler.isCoolingDown(a.account.uid))
-          .map((a) => a.auth?.realm)
-      );
-      const dynamicFree = this.discoveredModels
-        .filter((m) => m.isFree && (enabledRealms.size === 0 || enabledRealms.has(m.realm)))
-        .map((m) => m.id);
-      const pool = [...new Set([...dynamicFree, ...freeModels])];
-      const matched = pool.find((id) => {
-        const r = id.startsWith('global:') ? 'global' : id.startsWith('cn:') ? 'cn' : null;
-        return !r || enabledRealms.size === 0 || enabledRealms.has(r);
-      });
-      target = matched || freeModels[0] || 'global:hy4free';
+    if (target === 'auto-free' || target === 'free') {
+      const list = this.getFreeModelCandidates();
+      return list.length > 0 ? list : ['global:hy4free', 'cn:hy4free'];
     }
-    return target;
+
+    if (Array.isArray(modelRoutes[target]) && modelRoutes[target].length > 0) {
+      return this.sortCandidatesByHealth([...modelRoutes[target]]);
+    }
+
+    const clean = target.replace(/^(cn:|global:)/i, '').toLowerCase();
+    if (['hy4free', 'hy4-free', 'hunyuan-free', 'hunyuan4-free'].includes(clean)) {
+      const base = target.startsWith('cn:')
+        ? ['cn:hy4free', 'cn:hy4flash-exp1', 'cn:hy4flash-exp2', 'cn:hy4flash-exp3', 'global:hy4free']
+        : ['global:hy4free', 'cn:hy4free', 'cn:hy4flash-exp1', 'cn:hy4flash-exp2'];
+      return this.sortCandidatesByHealth(base);
+    }
+
+    return [target];
+  }
+
+  resolveModel(requestedModel) {
+    return this.resolveModelCandidates(requestedModel)[0] || 'global:hy4free';
   }
 
   applyPromptMode(payload) {
+    if (!Array.isArray(payload.messages)) return;
     const { promptMode, promptText } = this._getRuntimeConfig();
-    if (!promptMode || promptMode === 'none' || promptMode === 'passthrough' || !promptText || !Array.isArray(payload.messages)) {
+
+    if (
+      (promptMode === 'none' || promptMode === 'passthrough' || promptMode === 'append') &&
+      this.scheduler.degradeGate?.active()
+    ) {
+      const rest = payload.messages.filter((m) => m?.role !== 'system' && m?.role !== 'developer');
+      payload.messages = [{ role: 'system', content: DEGRADED_SYSTEM_PROMPT }, ...rest];
+      return;
+    }
+
+    if (!promptMode || promptMode === 'none' || promptMode === 'passthrough' || !promptText) {
       return;
     }
 
@@ -188,15 +308,15 @@ export class LoopbackGateway {
     }
 
     if (promptMode === 'append') {
-      const sysIdx = payload.messages.findIndex((m) => m?.role === 'system' || m?.role === 'developer');
-      if (sysIdx !== -1 && typeof payload.messages[sysIdx].content === 'string') {
-        payload.messages[sysIdx] = {
-          ...payload.messages[sysIdx],
-          content: `${payload.messages[sysIdx].content}\n\n${promptText}`
-        };
-      } else {
-        payload.messages = [{ role: 'system', content: promptText }, ...payload.messages];
+      let insertAt = 0;
+      while (insertAt < payload.messages.length) {
+        const r = String(payload.messages[insertAt]?.role || '').toLowerCase();
+        if (r !== 'system' && r !== 'developer') break;
+        insertAt++;
       }
+      const next = [...payload.messages];
+      next.splice(insertAt, 0, { role: 'system', content: promptText });
+      payload.messages = next;
     }
   }
 
@@ -284,7 +404,7 @@ export class LoopbackGateway {
   }
 
   getModelsList(includeDisabled = false, includeBare = false) {
-    const { aliases } = this._getRuntimeConfig();
+    const { aliases, modelRoutes, autoFreeEnabled } = this._getRuntimeConfig();
     const formatModelEntry = (m, overrideId = null) => {
       const id = overrideId || m.id;
       const prefix = m.rate && m.rate !== '-' && m.rate !== '视频' ? `[${m.rate} credit] ` : '';
@@ -334,6 +454,47 @@ export class LoopbackGateway {
       }
     }
 
+    if (autoFreeEnabled) {
+      const freeCandidates = this.getFreeModelCandidates();
+      const freeDesc = `[x0.00 credit] 智能免费模型自动路由池 (优先: ${freeCandidates.slice(0, 5).join(' -> ')})`;
+      for (const vid of ['auto-free', 'free']) {
+        if (!list.some((m) => m.id === vid)) {
+          list.push({
+            id: vid,
+            name: vid === 'auto-free' ? 'Auto Free (智能免费模型路由池)' : 'Free (智能免费路由别名)',
+            description: freeDesc,
+            object: 'model',
+            created: 1753600000,
+            owned_by: 'system',
+            credits: 'x0.00',
+            multiplier: 0,
+            is_free: true,
+            billing_rate: 'x0.00',
+            context_length: 131072,
+            max_output_tokens: 16384,
+            supports_reasoning: true,
+            supports_tool_call: true
+          });
+        }
+      }
+    }
+
+    for (const [groupName, targets] of Object.entries(modelRoutes)) {
+      if (groupName === 'auto-free' || groupName === 'free') continue;
+      if (!Array.isArray(targets) || targets.length === 0) continue;
+      if (!list.some((m) => m.id === groupName)) {
+        list.push({
+          id: groupName,
+          name: `${groupName} (自定义模型故障转移组)`,
+          description: `故障转移队列: ${targets.join(' -> ')}`,
+          object: 'model',
+          created: 1753600000,
+          owned_by: 'workbuddy2api-route',
+          supports_tool_call: true
+        });
+      }
+    }
+
     for (const [alias, target] of Object.entries(aliases)) {
       if (!list.some((m) => m.id === alias)) {
         list.push({
@@ -351,6 +512,48 @@ export class LoopbackGateway {
     return list;
   }
 
+  getPublicStatusSnapshot() {
+    const allAcc = this.scheduler.store.getAll();
+    const overall = this.scheduler.getCountsDetailed();
+    const cnCounts = this.scheduler.getCountsDetailed('cn');
+    const globalCounts = this.scheduler.getCountsDetailed('global');
+    const stats = this.ledger.getStats(this.getModelCatalogMap());
+
+    return {
+      status: overall.healthy > 0 ? 'ok' : 'degraded',
+      service: 'dsh-workbuddy2api',
+      version: SERVICE_VERSION,
+      port: this.actualPort || this.preferredPort,
+      total: overall.total,
+      healthy: overall.healthy,
+      cooling: overall.cooling,
+      disabled: overall.disabled,
+      manual_disabled: overall.manualDisabled,
+      in_flight_full: overall.inFlightFull,
+      realm_totals: { cn: cnCounts, global: globalCounts },
+      sticky_sessions: this.scheduler.stickyMap.size,
+      discoveredModels: this.discoveredModels.length,
+      waf_ip_blocked: this.scheduler.wafIPGate.active(),
+      degrade_active: this.scheduler.degradeGate.active(),
+      today: stats.today,
+      uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000)
+    };
+  }
+
+  getStatusPayload() {
+    const base = this.getPublicStatusSnapshot();
+    const accounts = this.scheduler.store.getAll().map((acc) => {
+      const diag = this.scheduler.getAccountDiagnostics(acc.account.uid);
+      return {
+        uid: acc.account.uid,
+        nickname: acc.account.nickname,
+        realm: acc.auth?.realm || 'cn',
+        ...diag
+      };
+    });
+    return { ...base, accounts, active: this.scheduler.store.activeUid };
+  }
+
   async start() {
     this.server = http.createServer(async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -366,7 +569,39 @@ export class LoopbackGateway {
       const pathname = url.pathname;
 
       try {
-        // 1. Web Console 控制台入口 (/ /console /dashboard)
+        const runtimeCfg = this._getRuntimeConfig();
+        const ipCheck = checkIPWhitelist(req, runtimeCfg.ipWhitelist);
+        if (!ipCheck.allowed) {
+          sendJson(res, 403, {
+            error: {
+              message: `Access denied by IP whitelist (client: ${ipCheck.clientIP})`,
+              type: 'access_denied',
+              code: 'ip_not_allowed'
+            }
+          });
+          return;
+        }
+
+        // 1. 公开展示门户 (/portal /ui/public/status) 与 Web Console (/ /console /dashboard)
+        if (req.method === 'GET' && (pathname === '/ui/public/status' || pathname === '/plugins/dsh-workbuddy2api/public/status')) {
+          sendJson(res, 200, {
+            ok: true,
+            ...this.getPublicStatusSnapshot(),
+            models: this.getModelsList(false, false).slice(0, 80)
+          });
+          return;
+        }
+
+        if (
+          req.method === 'GET' &&
+          (pathname === '/portal' || (pathname === '/' && runtimeCfg.portalAsHome)) &&
+          typeof this.portalHandler === 'function' &&
+          url.searchParams.get('format') !== 'json'
+        ) {
+          const handled = await this.portalHandler(req, res, pathname, url);
+          if (handled) return;
+        }
+
         if (
           req.method === 'GET' &&
           (pathname === '/' || pathname === '/console' || pathname === '/dashboard') &&
@@ -386,19 +621,16 @@ export class LoopbackGateway {
           if (handled) return;
         }
 
-        // 3. 健康检查端点 (/health /healthz /status /)
-        if (
-          req.method === 'GET' &&
-          (pathname === '/health' || pathname === '/healthz' || pathname === '/status' || pathname === '/')
-        ) {
+        // 3. 轻量健康检查 (/health /healthz /status /)
+        if (req.method === 'GET' && (pathname === '/health' || pathname === '/')) {
           const allAcc = this.scheduler.store.getAll();
           sendJson(res, 200, {
             status: 'ok',
             service: 'dsh-workbuddy2api',
-            version: '1.1.0',
+            version: SERVICE_VERSION,
             port: this.actualPort || this.preferredPort,
             accounts: allAcc.length,
-            enabledAccounts: allAcc.filter((a) => !a.disabled).length,
+            enabledAccounts: allAcc.filter((a) => !this.scheduler.isAccountUnavailable(a)).length,
             active: this.scheduler.store.activeUid,
             discoveredModels: this.discoveredModels.length,
             uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000)
@@ -406,10 +638,63 @@ export class LoopbackGateway {
           return;
         }
 
-        // 4. 以下 /v1/* /v2/* 等对外网关端点受 API Key 鉴权保护
+        if (req.method === 'GET' && pathname === '/healthz') {
+          const snap = this.getPublicStatusSnapshot();
+          res.setHeader('X-Service', 'dsh-workbuddy2api');
+          sendJson(res, snap.healthy > 0 ? 200 : 503, {
+            healthy: snap.healthy,
+            total: snap.total,
+            service: 'dsh-workbuddy2api',
+            realm_servable: {
+              cn: snap.realm_totals.cn.healthy > 0,
+              global: snap.realm_totals.global.healthy > 0
+            }
+          });
+          return;
+        }
+
+        // 4. 以下 /v1/* /v2/* /status /admin/* 等对外网关端点受 API Key 鉴权保护
         if (!this.checkAuth(req, url)) {
-          sendJson(res, 401, {
-            error: { message: 'Invalid or missing gateway API key', type: 'authentication_error' }
+          const authErr = req._authError || { status: 401, message: 'Invalid or missing gateway API key' };
+          sendJson(res, authErr.status, {
+            error: {
+              message: authErr.message,
+              type: authErr.status === 429 ? 'rate_limit_error' : 'authentication_error'
+            }
+          });
+          return;
+        }
+
+        if (req.method === 'GET' && pathname === '/status') {
+          sendJson(res, 200, this.getStatusPayload());
+          return;
+        }
+
+        // 4.1 运维账号停用/恢复/复活 API (/admin/accounts/:uid/{disable,enable,revive})
+        const adminMatch = pathname.match(/^\/admin\/accounts\/([^/]+)\/(disable|enable|revive)$/);
+        if (req.method === 'POST' && adminMatch) {
+          const targetUid = decodeURIComponent(adminMatch[1]);
+          const action = adminMatch[2];
+          const body = await readJsonBody(req, res) || {};
+          let op = null;
+          if (action === 'disable') {
+            op = this.scheduler.store.setManualDisabled(targetUid, true, body.reason || 'manual');
+          } else if (action === 'enable') {
+            op = this.scheduler.store.setManualDisabled(targetUid, false, '');
+          } else {
+            op = this.scheduler.store.reviveAccount(targetUid);
+            this.scheduler.clearCooldown(targetUid);
+          }
+          if (!op || !op.found) {
+            sendJson(res, 404, { error: { message: `account not found: ${targetUid}`, type: 'not_found' } });
+            return;
+          }
+          sendJson(res, 200, {
+            uid: targetUid,
+            manual_disabled: Boolean(op.acc.manualDisabled),
+            manual_reason: op.acc.manualDisabledReason || '',
+            disabled: Boolean(op.acc.disabled),
+            changed: Boolean(op.changed)
           });
           return;
         }
@@ -417,13 +702,14 @@ export class LoopbackGateway {
         // 5. 用量统计接口
         if (req.method === 'GET' && pathname === '/v1/stats') {
           const allAcc = this.scheduler.store.getAll();
+          const dateParam = url.searchParams.get('date') || '';
           sendJson(res, 200, {
             ok: true,
-            ...this.ledger.getStats(this.getModelCatalogMap()),
+            ...this.ledger.getStats(this.getModelCatalogMap(), dateParam),
             discoveredModels: this.discoveredModels.length,
             pool: {
               total: allAcc.length,
-              enabled: allAcc.filter((a) => !a.disabled).length
+              enabled: allAcc.filter((a) => !this.scheduler.isAccountUnavailable(a)).length
             }
           });
           return;
@@ -537,23 +823,52 @@ export class LoopbackGateway {
     });
   }
 
+  _handleObservedUsageCost(accUid, modelId, modelMeta, usage, sessionKey) {
+    if (!accUid || !usage) return;
+
+    const quota = usage.quota;
+    const isFree = Boolean(modelMeta?.isFree);
+    if (!isFree) return;
+
+    const charged = Boolean(usage.hasCredit && usage.credit > 0);
+    const quotaFull = Boolean(quota && Number(quota.percent || 0) >= 100);
+    if (!charged && !quotaFull) return;
+
+    const resetAtMs = parseQuotaResetAt(quota);
+    const bare = String(modelId || '').replace(/^(cn:|global:|solo:|trae:)/i, '');
+    const reason = `free quota exhausted (credit=${Number(usage.credit || 0).toFixed(2)}, quota=${Number(quota?.percent || 0)}%)`;
+    const targets = new Set([bare]);
+    if (Array.isArray(quota?.shared_models)) {
+      for (const sm of quota.shared_models) {
+        const cleanSm = String(sm || '').trim();
+        if (cleanSm) targets.add(cleanSm);
+      }
+    }
+    for (const m of targets) {
+      this.scheduler.cooldownFreeQuotaModel(accUid, resetAtMs, m, reason);
+    }
+    if (sessionKey) {
+      this.scheduler.stickyMap.delete(`${sessionKey}::${bare}`);
+    }
+  }
+
   /**
    * 统一多协议对话执行流水线（支持 OpenAI Chat / Anthropic Messages / OpenAI Responses）
    */
   async executeChatPipeline(req, res, body, protocol = 'chat', requestedModel = '') {
     const rawModel = requestedModel || body.model || 'auto-free';
-    const actualModel = this.resolveModel(rawModel);
-    body.model = actualModel;
-    this.applyPromptMode(body);
-
-    const isStream = Boolean(body.stream);
+    const candidates = this.resolveModelCandidates(rawModel);
+    const baseBody = { ...body };
+    const reqHasImage = requestHasImagePart(baseBody);
+    const isStream = Boolean(baseBody.stream);
     const reqId = `chatcmpl-${Date.now()}`;
+    const runtimeCfg = this._getRuntimeConfig();
 
     const conversationId =
       req.headers['x-conversation-id'] ||
       req.headers['x-session-id'] ||
-      body.conversation_id ||
-      body.conversationId ||
+      baseBody.conversation_id ||
+      baseBody.conversationId ||
       '';
 
     const meta = {
@@ -561,18 +876,82 @@ export class LoopbackGateway {
       conversationRequestId: req.headers['x-conversation-request-id'],
       traceId: req.headers['x-trace-id']
     };
-    const sessionKey = body.prompt_cache_key || conversationId || '';
+    const sessionKey = baseBody.prompt_cache_key || conversationId || '';
     const reqStartedAt = Date.now();
     const catalogMap = this.getModelCatalogMap();
-    const modelMeta = catalogMap.get(actualModel) || catalogMap.get(actualModel.replace(/^(cn:|global:)/i, ''));
-    const modelRate = modelMeta?.rate || '-';
+    const reqUser = req._wbUser || null;
+
+    let actualModel = candidates[0] || 'global:hy4free';
+    let modelMeta = catalogMap.get(actualModel) || catalogMap.get(actualModel.replace(/^(cn:|global:)/i, ''));
+    let modelRate = modelMeta?.rate || '-';
+    let execution = null;
+    let workingBody = { ...baseBody };
+    let pruneAttempts = 0;
 
     try {
-      const execution = await this.scheduler.executeWithFailover(
-        actualModel,
-        async (account) => await this.client.chatStream(account, body, undefined, meta),
-        { sessionKey }
-      );
+      let lastCandErr = null;
+      for (let candIdx = 0; candIdx < candidates.length; candIdx++) {
+        const candModel = candidates[candIdx];
+        if (candIdx < candidates.length - 1 && this.scheduler.isRouteModelCooling(candModel)) {
+          continue;
+        }
+        actualModel = candModel;
+        modelMeta = catalogMap.get(actualModel) || catalogMap.get(actualModel.replace(/^(cn:|global:)/i, ''));
+        modelRate = modelMeta?.rate || '-';
+
+        workingBody = { ...baseBody, model: actualModel };
+        this.applyPromptMode(workingBody);
+
+        let attemptSuccess = false;
+        while (!attemptSuccess) {
+          try {
+            execution = await this.scheduler.executeWithFailover(
+              actualModel,
+              async (account) => {
+                const ctrl = new AbortController();
+                return {
+                  ...(await this.client.chatStream(account, workingBody, ctrl.signal, meta)),
+                  abortController: ctrl
+                };
+              },
+              { sessionKey }
+            );
+            attemptSuccess = true;
+          } catch (innerErr) {
+            if (innerErr.kind === ErrKind.PROMPT_TOO_LONG && pruneAttempts < 2) {
+              const pruned = pruneOldestHistory(workingBody);
+              if (pruned.pruned) {
+                pruneAttempts += 1;
+                workingBody = pruned.payload;
+                console.warn(`[loopback] 11115 上下文超限，自动裁剪最早对话轮次抢救重试 (${pruneAttempts}/2)...`);
+                continue;
+              }
+            }
+            lastCandErr = innerErr;
+            // 非账户/路由类错误（内容拦截、图片无效、参数错误、11115 抢救后仍超限）直接抛出，不跨模型乱跳
+            if (
+              innerErr.kind === ErrKind.CONTENT_BLOCKED ||
+              innerErr.kind === ErrKind.IMAGE_INVALID ||
+              innerErr.kind === ErrKind.PROMPT_TOO_LONG ||
+              innerErr.kind === ErrKind.BAD_PARAMS ||
+              innerErr.code === 'waf_ip_blocked'
+            ) {
+              throw innerErr;
+            }
+            // 多模型路由池存在下一顺位候选时，触发模型级熔断并自动降级切换
+            if (candIdx < candidates.length - 1) {
+              this.scheduler.tripRouteModel(candModel, 60000);
+              console.warn(`[failover] 候选模型 ${candModel} 不可用 (${innerErr.message})，自动切换至 ${candidates[candIdx + 1]}`);
+            }
+            break;
+          }
+        }
+        if (execution) break;
+      }
+
+      if (!execution) {
+        throw lastCandErr || new Error('all accounts and candidate models are unavailable, please retry later');
+      }
 
       const accUid = execution.account?.account?.uid || '';
       const accNick = execution.account?.account?.nickname || accUid.slice(0, 8) || '-';
@@ -652,14 +1031,36 @@ export class LoopbackGateway {
       const reader = execution.bodyStream.getReader();
       const decoder = new TextDecoder();
       let clientClosed = false;
+      let idleTimer = null;
+      const idleMs = runtimeCfg.streamIdleTimeoutMs;
+
+      const armIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        if (idleMs > 0) {
+          idleTimer = setTimeout(() => {
+            clientClosed = true;
+            execution.abortController?.abort?.();
+            reader.cancel().catch(() => {});
+          }, idleMs);
+          if (idleTimer.unref) idleTimer.unref();
+        }
+      };
 
       const onResClose = () => {
         if (!res.writableEnded) {
           clientClosed = true;
+          execution.abortController?.abort?.();
           reader.cancel().catch(() => {});
         }
       };
       res.on('close', onResClose);
+
+      const hintCtx = {
+        model: actualModel.replace(/^(cn:|global:)/i, ''),
+        hasImage: reqHasImage,
+        modelInCatalog: Boolean(modelMeta),
+        modelSupportsImages: Boolean(modelMeta?.supportsImages ?? true)
+      };
 
       // 2. 流式转发与协议翻译
       if (isStream) {
@@ -675,6 +1076,8 @@ export class LoopbackGateway {
         const pump = createSSELinePump(res, {
           forwardRaw: protocol === 'chat',
           startTime: reqStartedAt,
+          transformErrorFrame: (errParsed) =>
+            injectFrameGatewayHint(errParsed, hintCtx, (st, txt) => this.client.classifyError(st, txt)),
           onEvent: (parsed) => {
             if (emitter && parsed) {
               emitter.pushOpenAIEvent(parsed);
@@ -683,9 +1086,11 @@ export class LoopbackGateway {
         });
 
         try {
+          armIdleTimer();
           while (!clientClosed) {
             const { done, value } = await reader.read();
             if (done) break;
+            armIdleTimer();
             pump.push(decoder.decode(value, { stream: true }));
           }
           const flushTail = decoder.decode();
@@ -697,11 +1102,16 @@ export class LoopbackGateway {
             res.end();
           }
         } finally {
+          if (idleTimer) clearTimeout(idleTimer);
           pump.stop();
           res.off('close', onResClose);
           this.scheduler.endInFlight(reqId);
           execution.release();
           const u = pump.getUsage();
+          if (this.userManager && reqUser && u.hasCredit && u.credit > 0) {
+            this.userManager.deductUserCredit(reqUser, u.credit);
+          }
+          this._handleObservedUsageCost(accUid, actualModel, modelMeta, u, sessionKey);
           const durationMs = Date.now() - reqStartedAt;
           this.ledger.record(actualModel, u.promptTokens, u.completionTokens, u.cacheHit, {
             ...u,
@@ -761,41 +1171,54 @@ export class LoopbackGateway {
       });
 
       try {
+        armIdleTimer();
         while (!clientClosed) {
           const { done, value } = await reader.read();
           if (done) break;
+          armIdleTimer();
           aggPump.push(decoder.decode(value, { stream: true }));
         }
         const tail = decoder.decode();
         if (tail) aggPump.push(tail);
         aggPump.finish();
       } finally {
+        if (idleTimer) clearTimeout(idleTimer);
         aggPump.stop();
         res.off('close', onResClose);
         this.scheduler.endInFlight(reqId);
         execution.release();
       }
 
+      let assembledCalls = [...toolCalls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => ({
+          id: v.id || `call_${Date.now()}`,
+          type: v.type || 'function',
+          function: {
+            name: v.function.name,
+            arguments: v.function.arguments || ''
+          }
+        }));
+      assembledCalls = dropTruncatedToolCalls(assembledCalls).map((c) => ({
+        ...c,
+        function: { ...c.function, arguments: c.function.arguments || '{}' }
+      }));
+
       const message = {
         role: 'assistant',
-        content: toolCalls.size > 0 && !fullText ? null : fullText
+        content: assembledCalls.length > 0 && !fullText ? null : fullText
       };
       if (reasoningText) message.reasoning_content = reasoningText;
-      if (toolCalls.size > 0) {
-        message.tool_calls = [...toolCalls.entries()]
-          .sort((a, b) => a[0] - b[0])
-          .map(([, v]) => ({
-            id: v.id || `call_${Date.now()}`,
-            type: v.type || 'function',
-            function: {
-              name: v.function.name,
-              arguments: v.function.arguments || '{}'
-            }
-          }));
+      if (assembledCalls.length > 0) {
+        message.tool_calls = assembledCalls;
         if (finishReason === 'stop') finishReason = 'tool_calls';
       }
 
       const usage = aggPump.getUsage();
+      if (this.userManager && reqUser && usage.hasCredit && usage.credit > 0) {
+        this.userManager.deductUserCredit(reqUser, usage.credit);
+      }
+      this._handleObservedUsageCost(accUid, actualModel, modelMeta, usage, sessionKey);
       const durationMs = Date.now() - reqStartedAt;
       const completionObj = {
         id: reqId,
@@ -807,7 +1230,7 @@ export class LoopbackGateway {
           prompt_tokens: usage.promptTokens,
           completion_tokens: usage.completionTokens,
           total_tokens: usage.promptTokens + usage.completionTokens,
-          ...(usage.hasCredit ? { credit: usage.credit } : {})
+          ...(usage.hasCredit ? { credit: usage.credit, cost_credits: usage.credit } : {})
         }
       };
 
@@ -838,7 +1261,21 @@ export class LoopbackGateway {
       });
     } catch (err) {
       this.scheduler.endInFlight(reqId);
-      const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+      const status = err.status && err.status >= 400 && err.status < 600
+        ? err.status
+        : (err.kind === ErrKind.SOFT_RATE ? 429 : 503);
+      if (err.retryAfterSec > 0 && !res.headersSent) {
+        res.setHeader('Retry-After', String(err.retryAfterSec));
+      }
+      const errKind = err.kind || ErrKind.NONE;
+      const gatewayHint =
+        getGatewayHint(errKind, err.message, {
+          model: actualModel.replace(/^(cn:|global:)/i, ''),
+          hasImage: reqHasImage,
+          modelInCatalog: Boolean(modelMeta),
+          modelSupportsImages: Boolean(modelMeta?.supportsImages ?? true)
+        }) || NO_HEALTHY_ACCOUNT_HINT;
+
       const durationMs = Date.now() - reqStartedAt;
       this.ledger.record(actualModel, 0, 0, false, { durationMs, success: false });
       this.ledger.addRequestLog({
@@ -857,11 +1294,20 @@ export class LoopbackGateway {
         if (protocol === 'anthropic') {
           sendJson(res, status, {
             type: 'error',
-            error: { type: 'api_error', message: err.message }
+            error: {
+              type: err.code || 'api_error',
+              message: err.message,
+              gateway_hint: gatewayHint
+            }
           });
         } else {
           sendJson(res, status, {
-            error: { message: err.message, type: 'api_error' }
+            error: {
+              message: err.message,
+              type: err.code || 'api_error',
+              code: err.code || (status === 429 ? 'rate_limit_exceeded' : 'no_healthy_account'),
+              gateway_hint: gatewayHint
+            }
           });
         }
       }

@@ -41,6 +41,8 @@ export class AccountStore {
             if (acc.account?.uid) {
               acc.disabled = Boolean(acc.disabled);
               acc.disabledReason = acc.disabledReason || '';
+              acc.manualDisabled = Boolean(acc.manualDisabled);
+              acc.manualDisabledReason = acc.manualDisabledReason || '';
               this.accounts.set(acc.account.uid, acc);
             }
           }
@@ -72,7 +74,7 @@ export class AccountStore {
 
     // 确保有激活账号
     if ((!this.activeUid || !this.accounts.has(this.activeUid)) && this.accounts.size > 0) {
-      const enabledFirst = this.getAll().find((a) => !a.disabled);
+      const enabledFirst = this.getAll().find((a) => !this.isAccountUnavailable(a));
       this.activeUid = enabledFirst?.account?.uid || this.accounts.keys().next().value;
     }
 
@@ -196,14 +198,69 @@ export class AccountStore {
     return false;
   }
 
+  isAccountUnavailable(acc) {
+    return Boolean(acc?.disabled || acc?.manualDisabled);
+  }
+
   setDisabled(uid, disabled, reason = '') {
     const acc = this.accounts.get(uid);
     if (!acc) return false;
     acc.disabled = Boolean(disabled);
-    acc.disabledReason = disabled ? (reason || '手动停用') : '';
+    acc.disabledReason = disabled ? (reason || '系统停用') : '';
+    acc.manualDisabled = Boolean(disabled);
+    acc.manualDisabledReason = disabled ? (reason || '手动停用') : '';
     acc.updatedAt = Date.now();
     this.save();
     return true;
+  }
+
+  setAutoDisabled(uid, disabled, reason = '') {
+    const acc = this.accounts.get(uid);
+    if (!acc) return false;
+    acc.disabled = Boolean(disabled);
+    acc.disabledReason = disabled ? (reason || '自动熔断禁用') : '';
+    acc.updatedAt = Date.now();
+    this.save();
+    return true;
+  }
+
+  setManualDisabled(uid, disabled, reason = 'manual') {
+    const acc = this.accounts.get(uid);
+    if (!acc) return false;
+    const prev = Boolean(acc.manualDisabled);
+    acc.manualDisabled = Boolean(disabled);
+    acc.manualDisabledReason = disabled ? (reason || 'manual') : '';
+    acc.updatedAt = Date.now();
+    this.save();
+    return { found: true, changed: prev !== acc.manualDisabled, acc };
+  }
+
+  reviveAccount(uid) {
+    const acc = this.accounts.get(uid);
+    if (!acc) return false;
+    const changed = Boolean(acc.disabled || acc.disabledReason);
+    acc.disabled = false;
+    acc.disabledReason = '';
+    acc.sessionDeadStreak = 0;
+    acc.updatedAt = Date.now();
+    this.save();
+    return { found: true, changed, acc };
+  }
+
+  updateAccountToken(uid, accessToken, refreshToken = '', expiresInSec = 7200) {
+    const acc = this.accounts.get(uid);
+    if (!acc) return null;
+    if (accessToken) acc.auth.accessToken = String(accessToken).trim();
+    if (refreshToken) acc.auth.refreshToken = String(refreshToken).trim();
+    acc.auth.expiresAt = Date.now() + Math.max(300, Number(expiresInSec || 7200)) * 1000;
+    acc.disabled = false;
+    acc.disabledReason = '';
+    acc.manualDisabled = false;
+    acc.manualDisabledReason = '';
+    acc.sessionDeadStreak = 0;
+    acc.updatedAt = Date.now();
+    this.save();
+    return acc;
   }
 
   upsert(account) {
@@ -217,6 +274,8 @@ export class AccountStore {
       auth: { ...(existing?.auth || {}), ...account.auth },
       disabled: account.disabled !== undefined ? Boolean(account.disabled) : Boolean(existing?.disabled),
       disabledReason: account.disabledReason ?? existing?.disabledReason ?? '',
+      manualDisabled: account.manualDisabled !== undefined ? Boolean(account.manualDisabled) : Boolean(existing?.manualDisabled),
+      manualDisabledReason: account.manualDisabledReason ?? existing?.manualDisabledReason ?? '',
       updatedAt: Date.now()
     };
     this.accounts.set(uid, merged);
