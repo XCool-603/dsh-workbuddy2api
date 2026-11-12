@@ -15,6 +15,7 @@ import {
   GLOBAL_BASE,
   REPORT_PATH
 } from '../constants.js';
+import { adoptFirstBuddy } from './travel.js';
 
 const WEB_BASE = 'https://www.workbuddy.cn';
 const DESKTOP_UA = 'WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1';
@@ -37,9 +38,13 @@ export const TASK_MAPPING = {
   chat_5: { kind: 'chat', target: 5, title: '和 AI 聊天 5 次' },
   Model_chat_GLM5_2: { kind: 'glmchat', target: 1, title: '体验 GLM-5.2 对话' },
   'Model_chat_GLM5.2': { kind: 'glmchat', target: 1, title: '体验 GLM-5.2 对话' },
-  black_cat: { kind: 'cat', target: 3, title: '夜猫子任务 (23:00-08:00)' },
+  black_cat: { kind: 'cat', target: 3, nightOnly: true, title: '夜猫子任务 (23:00-08:00 CST)' },
+  first_buddy: { kind: 'buddyfirst', target: 1, title: '领养第一只 AI 宠物' },
   RichMeow_Chat: { kind: 'richmeow', target: 1, title: '桌面端对话 1 次' },
   Library_read: { kind: 'library', target: 1, title: '体验「资料库」' },
+  skill_share: { kind: 'skillshare', target: 1, title: '分享热门技能给好友' },
+  Sequential_Tasks_1: { kind: 'minichat', target: 1, title: '小程序轻量对话 1 次' },
+  school_season: { kind: 'schoolseason', target: 1, title: '开学季主题活动任务' },
   expert_use_maidehao: { kind: 'fixed_expert', target: 1, expertId: 'ex_GDl31WahyIH0', title: '体验「中国电商运营专家」' },
   expert_use_douyinyin: { kind: 'fixed_expert', target: 1, expertId: 'ex_FbY5nlWTqDod', title: '体验「抖音策略师」' },
   expert_use_shangjia_xuanchuan: { kind: 'fixed_expert', target: 1, expertId: 'ex_Weo3x2EZuSDm', title: '体验「商家宣传页与海报设计师」' },
@@ -669,6 +674,49 @@ async function lightUpTask(account, code, spec, count, fetchFn = fetch) {
       return sendDesktopEvents(account, events, fetchFn);
     }
 
+    case 'buddyfirst': {
+      const adoptRes = await adoptFirstBuddy(account, fetchFn);
+      return Boolean(adoptRes?.ok);
+    }
+
+    case 'skillshare': {
+      const now = Date.now();
+      const skillId = 'skill_2096525080079265792';
+      const skillName = 'pptx';
+      const events = [
+        { eventCode: 'skill_share_entry_click', skillId, skillName, skillType: 'market', skillSource: 'official', entry: 'detail', status: 'safe', actionSuccessful: true, clickAt: now, userId: uid },
+        { eventCode: 'skill_share_channel_action', skillId, skillName, skillType: 'market', action: 'wechat', panelAction: 'click', panelType: 'mini_program_card', isSuccessful: true, cost: 0, id: `share-${now}`, actionAt: now, userId: uid },
+        { eventCode: 'skill_share_channel_action', skillId, skillName, skillType: 'market', action: 'wechat', panelAction: 'success', panelType: 'mini_program_card', isSuccessful: true, cost: 12, id: `share-${now}`, actionAt: now, userId: uid },
+        { eventCode: 'skill_share_channel_action', skillId, skillName, skillType: 'market', action: 'link', panelAction: 'success', panelType: 'clipboard', isSuccessful: true, cost: 12, id: `share-${now}-link`, actionAt: now, userId: uid }
+      ];
+      return sendDesktopEvents(account, events, fetchFn);
+    }
+
+    case 'minichat':
+    case 'schoolseason': {
+      const now = Date.now();
+      const cid = `wb-mp-${now}`;
+      const ev = {
+        eventCode: 'chat_request_send',
+        timestamp: now,
+        reportDelay: 0,
+        source: 'mini_program',
+        ideName: 'wx_app_cloud',
+        ideType: 'WorkBuddy_MP',
+        extName: 'workbuddy-mp',
+        extVersion: '2.4.0',
+        mode: 'chat',
+        conversationId: cid,
+        requestId: cid,
+        inputLength: 12,
+        mentionContexts: [],
+        mentionContextCount: 0,
+        userId: uid
+      };
+      if (spec.kind === 'schoolseason') ev.activityId = 'school_open_day_2026';
+      return sendBillingJson([ev]);
+    }
+
     case 'library': {
       return sendWebEvent(
         account,
@@ -683,6 +731,23 @@ async function lightUpTask(account, code, spec, count, fetchFn = fetch) {
     default:
       return false;
   }
+}
+
+export function isCSTNightWindow(now = new Date()) {
+  const cstHour = new Date(now.getTime() + 8 * 3600 * 1000).getUTCHours();
+  return cstHour >= 23 || cstHour < 8;
+}
+
+export async function runNightCatTask(account, fetchFn = fetch) {
+  if (account?.auth?.realm === 'global') return { ok: true, skipped: true };
+  if (!isCSTNightWindow()) {
+    return { ok: true, skipped: true, reason: 'outside_cst_night_window_23_08' };
+  }
+  const spec = TASK_MAPPING.black_cat;
+  const ok = await lightUpTask(account, 'black_cat', spec, spec.target || 3, fetchFn);
+  await new Promise((r) => setTimeout(r, 1200));
+  const claimRes = await claimGrowthTask(account, 'black_cat', fetchFn);
+  return { ok: ok || claimRes.ok, ...claimRes };
 }
 
 /**

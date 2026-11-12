@@ -22,6 +22,10 @@ import {
   fetchGrowthTasks,
   runAllGrowthTasks
 } from '../upstream/tasks.js';
+import {
+  fetchSchoolStatus,
+  runSchoolActivity
+} from '../upstream/school.js';
 import { startOAuthFlow, pollOAuthFlow } from '../upstream/oauth.js';
 import { claimGlobalTrial } from '../upstream/trial.js';
 import { fetchInviteInfo, bindInviteCode } from '../upstream/invite.js';
@@ -127,6 +131,7 @@ export function registerWebRoutes(ctx, deps) {
       const bal = await client.fetchBalance(account);
       balanceCache.set(uid, { data: bal, fetchedAt: Date.now() });
       scheduler.updateAccountCredits(uid, bal.remain, bal.expiringRemain);
+      scheduler.reenableIfCredits(uid, bal.remain);
       alertManager?.notifyLowCredit(uid, account.account.nickname, bal.remain);
       return bal;
     } catch (err) {
@@ -576,7 +581,7 @@ export function registerWebRoutes(ctx, deps) {
       handler: async (req, res) => {
         const body = await parseJsonBody(req);
         if (body.all) {
-          const list = store.getAll().filter((a) => !scheduler.isAccountUnavailable(a));
+          const list = store.getAll().filter((a) => !a.disabled);
           const results = [];
           for (const acc of list) {
             try {
@@ -963,6 +968,48 @@ export function registerWebRoutes(ctx, deps) {
         const result = await runAllGrowthTasks(target);
         invalidateBalance(target.account.uid);
         sendJson(res, 200, { ok: true, uid, result });
+      }
+    },
+
+    // 17.1 开学季活动 (school_open_day_2026) 盘点、自动点灯、领积分与大转盘抽奖
+    {
+      path: '/plugins/dsh-workbuddy2api/school/status',
+      handler: async (req, res) => {
+        const u = new URL(req.url, 'http://localhost');
+        const uid = u.searchParams.get('uid') || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        const status = await fetchSchoolStatus(target);
+        sendJson(res, 200, { ok: Boolean(status?.ok), uid, status });
+      }
+    },
+    {
+      path: '/plugins/dsh-workbuddy2api/school/run',
+      handler: async (req, res) => {
+        const body = await parseJsonBody(req);
+        const opts = {
+          lightUp: body.lightUp !== false,
+          claim: body.claim !== false,
+          draw: body.draw !== false
+        };
+        if (body.all) {
+          const results = await scheduler.runAllSchool(opts);
+          invalidateBalance();
+          sendJson(res, 200, { ok: true, results });
+          return;
+        }
+        const uid = body.uid || store.activeUid;
+        const target = store.get(uid);
+        if (!target) {
+          sendJson(res, 404, { ok: false, message: '账号未找到' });
+          return;
+        }
+        const result = await runSchoolActivity(target, opts);
+        invalidateBalance(target.account.uid);
+        sendJson(res, 200, { ok: Boolean(result?.ok), uid, result });
       }
     },
 

@@ -28,6 +28,9 @@ export class AccountStore {
     this.skipDiscovery = Boolean(options.skipDiscovery);
     this.accounts = new Map();
     this.activeUid = null;
+    this._authWatchTimer = null;
+    this._lastAuthFingerprint = '';
+    this._fileSignatures = new Map();
     this.init();
   }
 
@@ -81,17 +84,32 @@ export class AccountStore {
     this.save();
   }
 
-  importFromAuthDir(dirPath) {
-    if (!dirPath || !fs.existsSync(dirPath)) return;
+  importFromAuthDir(dirPath, options = {}) {
+    if (!dirPath || !fs.existsSync(dirPath)) return { added: 0, updated: 0 };
+    let added = 0;
+    let updated = 0;
+    const updateExisting = Boolean(options.updateExisting);
     try {
       const files = fs.readdirSync(dirPath).filter((f) => f.endsWith('.json'));
       for (const file of files) {
         try {
           const filePath = path.join(dirPath, file);
+          const stat = fs.statSync(filePath);
+          const sig = `${stat.mtimeMs}|${stat.size}`;
+          if (updateExisting && this._fileSignatures.get(filePath) === sig) {
+            continue;
+          }
           const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
           const uid = raw.account?.uid || raw.uid;
-          if (uid && !this.accounts.has(uid)) {
-            const realm = raw.auth?.realm || raw.realm || (file.includes('cn') ? 'cn' : 'global');
+          if (!uid) continue;
+
+          const realm = raw.auth?.realm || raw.realm || (file.includes('cn') ? 'cn' : 'global');
+          const accessToken = raw.auth?.accessToken || raw.accessToken || '';
+          const refreshToken = raw.auth?.refreshToken || raw.refreshToken || '';
+          const expiresAt = raw.auth?.expiresAt || raw.expiresAt || 0;
+          const domain = raw.auth?.domain || raw.domain || '';
+
+          if (!this.accounts.has(uid)) {
             const acc = {
               account: {
                 uid,
@@ -101,23 +119,49 @@ export class AccountStore {
               },
               auth: {
                 realm,
-                accessToken: raw.auth?.accessToken || raw.accessToken || '',
-                refreshToken: raw.auth?.refreshToken || raw.refreshToken || '',
-                expiresAt: raw.auth?.expiresAt || raw.expiresAt || 0,
-                domain: raw.auth?.domain || raw.domain || ''
+                accessToken,
+                refreshToken,
+                expiresAt,
+                domain
               },
               disabled: Boolean(raw.disabled),
               disabledReason: raw.disabledReason || '',
+              manualDisabled: Boolean(raw.manualDisabled),
+              manualDisabledReason: raw.manualDisabledReason || '',
               source: 'workbuddy2api-auths',
               updatedAt: Date.now()
             };
             this.accounts.set(uid, acc);
+            added++;
+          } else if (updateExisting) {
+            const existing = this.accounts.get(uid);
+            const accessChanged = Boolean(accessToken && accessToken !== existing.auth?.accessToken);
+            const refreshChanged = Boolean(refreshToken && refreshToken !== existing.auth?.refreshToken);
+            if (accessChanged || refreshChanged) {
+              existing.auth = {
+                ...(existing.auth || {}),
+                realm: realm || existing.auth?.realm || 'cn',
+                accessToken: accessToken || existing.auth?.accessToken || '',
+                refreshToken: refreshToken || existing.auth?.refreshToken || '',
+                expiresAt: expiresAt || existing.auth?.expiresAt || 0,
+                domain: domain || existing.auth?.domain || ''
+              };
+              if (accessChanged) {
+                existing.disabled = false;
+                existing.disabledReason = '';
+                existing.sessionDeadStreak = 0;
+              }
+              existing.updatedAt = Date.now();
+              updated++;
+            }
           }
+          this._fileSignatures.set(filePath, sig);
         } catch (_) {}
       }
     } catch (err) {
       console.warn('[account-store] 导入 auths 目录异常:', err.message);
     }
+    return { added, updated };
   }
 
   importFromCodeBuddyCli() {
@@ -293,5 +337,82 @@ export class AccountStore {
     }
     this.save();
     return deleted;
+  }
+
+  getAuthWatchDirs() {
+    return [
+      ...new Set(
+        [this.authDir, path.join(this.dshHome, 'workbuddy2api-auths')].filter(Boolean)
+      )
+    ];
+  }
+
+  _computeAuthDirsFingerprint(dirs = this.getAuthWatchDirs()) {
+    const entries = [];
+    for (const dir of dirs) {
+      if (!dir || !fs.existsSync(dir)) continue;
+      try {
+        const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
+        for (const f of files) {
+          try {
+            const st = fs.statSync(path.join(dir, f));
+            entries.push(`${dir}|${f}|${st.mtimeMs}|${st.size}`);
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    return entries.join(';');
+  }
+
+  /**
+   * 扫描被监控的 auths 目录，热加载新增或更新了 Token 的账号（保留既有禁用/统计状态）
+   */
+  scanAuthDirsOnce(dirs = this.getAuthWatchDirs()) {
+    const fp = this._computeAuthDirsFingerprint(dirs);
+    if (fp === this._lastAuthFingerprint) {
+      return { changed: false, added: 0, updated: 0 };
+    }
+    this._lastAuthFingerprint = fp;
+    let added = 0;
+    let updated = 0;
+    for (const dir of dirs) {
+      const res = this.importFromAuthDir(dir, { updateExisting: true });
+      added += res.added;
+      updated += res.updated;
+    }
+    if (added > 0 || updated > 0) {
+      if ((!this.activeUid || !this.accounts.has(this.activeUid)) && this.accounts.size > 0) {
+        const enabledFirst = this.getAll().find((a) => !this.isAccountUnavailable(a));
+        this.activeUid = enabledFirst?.account?.uid || this.accounts.keys().next().value;
+      }
+      this.save();
+      console.log(`[account-store] auths 目录热重载完成: 新增 ${added}, 更新 ${updated}`);
+      return { changed: true, added, updated };
+    }
+    return { changed: false, added: 0, updated: 0 };
+  }
+
+  /**
+   * 启动 auths 目录后台轮询监听（默认 5s 一次，对齐 Go pool/watch.go）
+   */
+  startAuthDirWatch(intervalMs = 5000, dirs = null) {
+    if (this._authWatchTimer) return;
+    const watchDirs = dirs && Array.isArray(dirs) ? dirs : this.getAuthWatchDirs();
+    this._lastAuthFingerprint = this._computeAuthDirsFingerprint(watchDirs);
+    this._authWatchTimer = setInterval(() => {
+      try {
+        this.scanAuthDirsOnce(watchDirs);
+      } catch (err) {
+        console.warn('[account-store] auths 目录热重载轮询异常:', err.message);
+      }
+    }, Math.max(50, Number(intervalMs) || 5000));
+    if (this._authWatchTimer.unref) this._authWatchTimer.unref();
+  }
+
+  stopAuthDirWatch() {
+    if (this._authWatchTimer) {
+      clearInterval(this._authWatchTimer);
+      this._authWatchTimer = null;
+    }
   }
 }

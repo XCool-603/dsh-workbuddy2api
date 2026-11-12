@@ -179,6 +179,10 @@ export function anthropicToOpenAI(body = {}) {
     stream: !!body.stream
   };
 
+  if (body.metadata && typeof body.metadata === 'object') {
+    openaiPayload.metadata = body.metadata;
+  }
+
   if (typeof body.temperature === 'number') openaiPayload.temperature = body.temperature;
   if (typeof body.top_p === 'number') openaiPayload.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) {
@@ -330,6 +334,22 @@ export function createAnthropicStreamEmitter(res, requestedModel) {
     pushOpenAIEvent(parsed) {
       if (!parsed || ended) return;
 
+      if (parsed.error) {
+        ended = true;
+        closeActiveSimpleBlock();
+        closeAllToolBlocks();
+        sendAnthropicEvent(res, 'error', {
+          type: 'error',
+          error: {
+            type: parsed.error.type || 'api_error',
+            message: parsed.error.message || 'Upstream streaming error',
+            ...(parsed.error.gateway_hint ? { gateway_hint: parsed.error.gateway_hint } : {})
+          }
+        });
+        if (!res.writableEnded) res.end();
+        return;
+      }
+
       if (parsed.usage) {
         const pt = Number(parsed.usage.prompt_tokens || 0);
         const ct = Number(parsed.usage.completion_tokens || 0);
@@ -453,4 +473,61 @@ export function createAnthropicStreamEmitter(res, requestedModel) {
       if (!res.writableEnded) res.end();
     }
   };
+}
+
+/**
+ * 估算 Anthropic Messages 请求的输入 Token 数（用于 /v1/messages/count_tokens）
+ */
+export function estimateAnthropicInputTokens(body = {}) {
+  let cjkChars = 0;
+  let otherChars = 0;
+  let imageTokens = 0;
+  let messageOverhead = 0;
+
+  const countText = (str) => {
+    if (!str || typeof str !== 'string') return;
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      if (code >= 0x4e00 && code <= 0x9fff) cjkChars++;
+      else otherChars++;
+    }
+  };
+
+  const countContent = (content) => {
+    if (typeof content === 'string') {
+      countText(content);
+      return;
+    }
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!block) continue;
+      if (typeof block === 'string') {
+        countText(block);
+      } else if (block.type === 'text' || block.type === 'thinking') {
+        countText(block.text || block.thinking || '');
+      } else if (block.type === 'tool_use') {
+        countText(block.name || '');
+        countText(typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {}));
+      } else if (block.type === 'tool_result') {
+        countContent(block.content);
+      } else if (block.type === 'image') {
+        imageTokens += 1024;
+      } else {
+        countText(JSON.stringify(block));
+      }
+    }
+  };
+
+  if (body.system) countContent(body.system);
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      messageOverhead += 4;
+      if (msg?.content) countContent(msg.content);
+    }
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    countText(JSON.stringify(body.tools));
+  }
+
+  return Math.max(1, Math.round(cjkChars * 0.7 + otherChars * 0.28 + messageOverhead + imageTokens));
 }

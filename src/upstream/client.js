@@ -45,6 +45,7 @@ export class UpstreamClient {
     this.deviceTokenPath = options.deviceTokenPath || process.env.WB_DEVICE_TOKEN_FILE || '';
     this._deviceTokenCache = { path: '', token: '', readAt: 0 };
     this.modelCatalog = options.modelCatalog || new ModelCatalogEnricher({ dshHome: options.dshHome });
+    this.refreshFlights = new Map();
   }
 
   readDeviceToken() {
@@ -205,7 +206,27 @@ export class UpstreamClient {
   /**
    * 刷新账号 Token
    */
-  async refreshToken(account) {
+  /**
+   * 刷新账号 Token（按 uid 单飞 coalescing，防止并发请求重复消费单次 refreshToken）
+   */
+  refreshToken(account) {
+    const uid = account?.account?.uid || '';
+    if (!uid) return this._doRefreshToken(account);
+    if (this.refreshFlights.has(uid)) {
+      return this.refreshFlights.get(uid);
+    }
+    const flight = Promise.resolve()
+      .then(() => this._doRefreshToken(account))
+      .finally(() => {
+        if (this.refreshFlights.get(uid) === flight) {
+          this.refreshFlights.delete(uid);
+        }
+      });
+    this.refreshFlights.set(uid, flight);
+    return flight;
+  }
+
+  async _doRefreshToken(account) {
     if (!account.auth?.refreshToken) {
       throw new Error('No refresh token available');
     }

@@ -16,8 +16,17 @@ import { writeSSEHeaders, createSSELinePump, formatOpenAIChunk } from './sse.js'
 import {
   anthropicToOpenAI,
   openAIToAnthropicResponse,
-  createAnthropicStreamEmitter
+  createAnthropicStreamEmitter,
+  estimateAnthropicInputTokens
 } from './messages.js';
+import {
+  extractSessionKey,
+  resolveConversationId,
+  stickyFallbackKey,
+  turnKey,
+  deriveTurnRequestId,
+  uuidForKey
+} from '../upstream/session.js';
 import {
   responsesToChatPayload,
   chatCompletionToResponseObject,
@@ -753,6 +762,14 @@ export class LoopbackGateway {
           return;
         }
 
+        // 8.1 Anthropic Token 估算接口 (/v1/messages/count_tokens)
+        if (req.method === 'POST' && (pathname === '/v1/messages/count_tokens' || pathname === '/messages/count_tokens')) {
+          const body = await readJsonBody(req, res);
+          if (!body) return;
+          sendJson(res, 200, { input_tokens: estimateAnthropicInputTokens(body) });
+          return;
+        }
+
         // 9. OpenAI Responses API (/v1/responses)
         if (req.method === 'POST' && (pathname === '/v1/responses' || pathname === '/responses')) {
           const body = await readJsonBody(req, res);
@@ -864,19 +881,21 @@ export class LoopbackGateway {
     const reqId = `chatcmpl-${Date.now()}`;
     const runtimeCfg = this._getRuntimeConfig();
 
+    const explicitSession = extractSessionKey(req.headers, baseBody);
+    const sessionKey = explicitSession || stickyFallbackKey(baseBody) || '';
+    const tKey = turnKey(baseBody);
+    const derivedReqId =
+      req.headers['x-conversation-request-id'] ||
+      deriveTurnRequestId(sessionKey, tKey);
     const conversationId =
-      req.headers['x-conversation-id'] ||
-      req.headers['x-session-id'] ||
-      baseBody.conversation_id ||
-      baseBody.conversationId ||
-      '';
+      resolveConversationId(req.headers, baseBody) ||
+      (sessionKey ? uuidForKey(sessionKey) : '');
 
     const meta = {
       conversationId,
-      conversationRequestId: req.headers['x-conversation-request-id'],
+      conversationRequestId: derivedReqId,
       traceId: req.headers['x-trace-id']
     };
-    const sessionKey = baseBody.prompt_cache_key || conversationId || '';
     const reqStartedAt = Date.now();
     const catalogMap = this.getModelCatalogMap();
     const reqUser = req._wbUser || null;

@@ -2,11 +2,14 @@
  * scheduler.js - 账号池智能调度引擎、模型级软熔断、Sticky 亲和路由与并发排队
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { ErrKind } from '../constants.js';
 import { runTravelForAccount } from '../upstream/travel.js';
 import { claimAllWelfare } from '../upstream/growth.js';
 import { performCheckin } from '../upstream/checkin.js';
-import { runAllGrowthTasks } from '../upstream/tasks.js';
+import { runAllGrowthTasks, runNightCatTask, isCSTNightWindow } from '../upstream/tasks.js';
+import { runSchoolActivity } from '../upstream/school.js';
 import { getNextMidnightCSTMs } from '../upstream/hint.js';
 
 const STICKY_TTL_MS = 15 * 60 * 1000;
@@ -17,6 +20,8 @@ const WAF_IP_WINDOW_MS = 60 * 1000;
 const WAF_IP_THRESHOLD = 2;
 const MODEL_BLOCK_BASE_MS = 6 * 3600 * 1000;
 const MODEL_BLOCK_MAX_MS = 24 * 3600 * 1000;
+const CONSECUTIVE_FAIL_THRESHOLD = 5;
+const DEGRADE_COOLDOWN_MS = 300 * 1000;
 
 function stripModelRealm(model = '') {
   return String(model).replace(/^(cn|global|solo|trae):/i, '');
@@ -94,15 +99,98 @@ export class Scheduler {
     this.accountCredits = new Map();  // uid -> { remain, expiringRemain, updatedAt }
     this.stickyMap = new Map();       // `${sessionKey}::${bareModel}` -> { uid, expiresAt }
     this.accountStats = new Map();    // uid -> { successCount, failCount, lastSuccessAt, lastErrorAt, lastErrorMsg, lastModel }
+    this.consecutiveFails = new Map(); // uid -> consecutive transient failure count
     this.waiters = [];
 
     this.wafIPGate = new WafIPGate();
     this.degradeGate = new DegradeGate();
     this._executedScheduleSlots = new Set();
 
+    const dshHome = options.dshHome || accountStore?.dshHome || '';
+    this.statePath = options.statePath === false
+      ? ''
+      : (options.statePath || (dshHome ? path.join(dshHome, '.workbuddy2api-state.json') : ''));
+    this._stateSaveTimer = null;
+    this._loadState();
+
     this.autoTimer = null;
     this.scheduleTimer = null;
     this.keepaliveTimer = null;
+  }
+
+  _loadState() {
+    if (!this.statePath) return;
+    try {
+      if (!fs.existsSync(this.statePath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+      const now = Date.now();
+      if (raw.degradeUntil && raw.degradeUntil > now) {
+        this.degradeGate.until = Number(raw.degradeUntil);
+      }
+      if (raw.circuitBreakers && typeof raw.circuitBreakers === 'object') {
+        for (const [k, v] of Object.entries(raw.circuitBreakers)) {
+          if (v && v.cooldownUntil > now) this.circuitBreakers.set(k, v);
+        }
+      }
+      if (raw.modelBreakers && typeof raw.modelBreakers === 'object') {
+        for (const [k, v] of Object.entries(raw.modelBreakers)) {
+          if (v && v.cooldownUntil > now) this.modelBreakers.set(k, v);
+        }
+      }
+      if (raw.accountCredits && typeof raw.accountCredits === 'object') {
+        for (const [k, v] of Object.entries(raw.accountCredits)) {
+          if (v && typeof v === 'object') this.accountCredits.set(k, v);
+        }
+      }
+    } catch (err) {
+      console.warn('[scheduler] 读取持久化运行状态异常:', err.message);
+    }
+  }
+
+  flushState() {
+    if (this._stateSaveTimer) {
+      clearTimeout(this._stateSaveTimer);
+      this._stateSaveTimer = null;
+    }
+    if (!this.statePath) return;
+    try {
+      const now = Date.now();
+      const circuitBreakers = {};
+      for (const [k, v] of this.circuitBreakers.entries()) {
+        if (v && v.cooldownUntil > now) circuitBreakers[k] = v;
+      }
+      const modelBreakers = {};
+      for (const [k, v] of this.modelBreakers.entries()) {
+        if (v && v.cooldownUntil > now) modelBreakers[k] = v;
+      }
+      const accountCredits = {};
+      for (const [k, v] of this.accountCredits.entries()) {
+        accountCredits[k] = v;
+      }
+      const payload = {
+        savedAt: now,
+        degradeUntil: this.degradeGate.active(now) ? this.degradeGate.until : 0,
+        circuitBreakers,
+        modelBreakers,
+        accountCredits
+      };
+      fs.mkdirSync(path.dirname(this.statePath), { recursive: true });
+      const tmpPath = `${this.statePath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.statePath);
+    } catch (err) {
+      console.warn('[scheduler] 保存持久化运行状态异常:', err.message);
+    }
+  }
+
+  _scheduleSaveState() {
+    if (!this.statePath) return;
+    if (this._stateSaveTimer) return;
+    this._stateSaveTimer = setTimeout(() => {
+      this._stateSaveTimer = null;
+      this.flushState();
+    }, 200);
+    if (this._stateSaveTimer.unref) this._stateSaveTimer.unref();
   }
 
   updateAccountCredits(uid, remain = 0, expiringRemain = 0) {
@@ -112,6 +200,7 @@ export class Scheduler {
       expiringRemain: Number(expiringRemain || 0),
       updatedAt: Date.now()
     });
+    this._scheduleSaveState();
   }
 
   beginInFlight(reqId, info) {
@@ -293,19 +382,50 @@ export class Scheduler {
   }
 
   /**
-   * 记录调用成功，重置对应熔断器并更新统计
+   * 记录调用成功，重置对应熔断器与连续失败计数并更新统计
    */
   recordSuccess(account, model = '') {
     const uid = account?.account?.uid;
     if (!uid) return;
-    this.circuitBreakers.delete(uid);
-    if (model) {
-      this.modelBreakers.delete(`${uid}::${stripModelRealm(model)}`);
-    }
+    const hadCb = this.circuitBreakers.delete(uid);
+    const hadMb = model ? this.modelBreakers.delete(`${uid}::${stripModelRealm(model)}`) : false;
+    this.consecutiveFails.delete(uid);
     const st = this._getOrCreateStats(uid);
     st.successCount += 1;
     st.lastSuccessAt = Date.now();
     if (model) st.lastModel = stripModelRealm(model);
+    if (hadCb || hadMb) {
+      this._scheduleSaveState();
+    }
+  }
+
+  /**
+   * 记录瞬态失败（5 次连续未知/传输错误触发 300s 固定临时降级，不叠加延长已有冷却，对齐 Go pool/degrade.go）
+   */
+  noteTransientFailure(uid, kind = 'transient', message = '') {
+    if (!uid) return false;
+    const next = (this.consecutiveFails.get(uid) || 0) + 1;
+    this.consecutiveFails.set(uid, next);
+    if (next < CONSECUTIVE_FAIL_THRESHOLD) {
+      console.warn(`[degrade] 账号 ${uid} 瞬态异常 (${next}/${CONSECUTIVE_FAIL_THRESHOLD}, ${kind}): ${message}`);
+      return false;
+    }
+    const now = Date.now();
+    const prev = this.circuitBreakers.get(uid);
+    if (prev && now < prev.cooldownUntil) {
+      // 已处于冷却期间则不延长 cooldownUntil
+      return false;
+    }
+    this.consecutiveFails.delete(uid);
+    this.circuitBreakers.set(uid, {
+      failures: next,
+      cooldownUntil: now + DEGRADE_COOLDOWN_MS,
+      kind: kind || 'degraded',
+      reason: `连续 ${next} 次瞬态异常降级 ${DEGRADE_COOLDOWN_MS / 1000}s: ${message}`
+    });
+    this._scheduleSaveState();
+    console.warn(`[degrade] 账号 ${uid} 连续 ${next} 次异常，触发固定 ${DEGRADE_COOLDOWN_MS / 1000}s 临时降级: ${message}`);
+    return true;
   }
 
   /**
@@ -344,6 +464,7 @@ export class Scheduler {
         kind,
         reason: `11102 ${message}`
       });
+      this._scheduleSaveState();
       console.warn(`[scheduler] 账号 ${uid} 模型 [${bareModel}] 11102 后端不支持，负缓存 ${Math.round(ttl / 3600000)}h`);
       return;
     }
@@ -370,11 +491,19 @@ export class Scheduler {
 
       mb.cooldownUntil = Date.now() + cooldownMs;
       this.modelBreakers.set(mKey, mb);
+      this._scheduleSaveState();
       console.warn(`[scheduler] 账号 ${uid} 模型 [${bareModel}] 触发模型级软熔断 (${kind}), 冷却 ${Math.round(cooldownMs / 1000)}s: ${message}`);
       return;
     }
 
+    // 未知/传输/客户端瞬态异常走 NoteFailures 连续 5 次阈值保护，不立刻踢出账号池
+    if (!kind || kind === ErrKind.CLIENT || kind === 'unknown' || kind === 'network') {
+      this.noteTransientFailure(uid, kind || 'transient', message);
+      return;
+    }
+
     // 账号级熔断
+    this.consecutiveFails.delete(uid);
     const cb = this.circuitBreakers.get(uid) || { failures: 0, cooldownUntil: 0, kind: '', reason: '' };
     cb.failures += 1;
     cb.kind = kind;
@@ -416,6 +545,7 @@ export class Scheduler {
 
     cb.cooldownUntil = Date.now() + cooldownMs;
     this.circuitBreakers.set(uid, cb);
+    this._scheduleSaveState();
     console.warn(`[scheduler] 账号 ${uid} 触发账号级熔断保护 (${kind}), 冷却时长 ${Math.round(cooldownMs / 1000)}s: ${message}`);
   }
 
@@ -437,7 +567,37 @@ export class Scheduler {
       kind: ErrKind.SOFT_RATE,
       reason: reason || 'free_quota_exhausted'
     });
+    this._scheduleSaveState();
     console.warn(`[free-guard] 账号 ${uid} 免费模型 [${bare}] 额度耗尽，模型级锁定至 ${new Date(until).toISOString()}`);
+  }
+
+  /**
+   * 当巡检发现账号重新获得有效积分余额（remain > 0）时自动解除积分不足引发的冷却/自动禁用（绝不覆盖 manualDisabled）
+   */
+  reenableIfCredits(uid, remain = 0) {
+    if (!uid || Number(remain || 0) <= 0) return false;
+    const acc = this.store.get(uid);
+    if (!acc || acc.manualDisabled) return false;
+
+    let changed = false;
+    if (
+      acc.disabled &&
+      /credit|余额|11111|11112|402|quota/i.test(acc.disabledReason || '') &&
+      typeof this.store.reviveAccount === 'function'
+    ) {
+      this.store.reviveAccount(uid);
+      changed = true;
+    }
+    const cb = this.circuitBreakers.get(uid);
+    if (cb && (cb.kind === ErrKind.HARD_CREDIT || /credit|余额|11111|11112|quota/i.test(cb.reason || ''))) {
+      this.circuitBreakers.delete(uid);
+      changed = true;
+    }
+    if (changed) {
+      this._scheduleSaveState();
+      console.log(`[scheduler] 账号 ${uid} 检测到可用余额 (${remain})，已自动解除积分冷却`);
+    }
+    return changed;
   }
 
   /**
@@ -446,6 +606,7 @@ export class Scheduler {
   clearCooldown(uid) {
     if (!uid) return false;
     let cleared = this.circuitBreakers.delete(uid);
+    this.consecutiveFails.delete(uid);
     const prefix = `${uid}::`;
     for (const key of this.modelBreakers.keys()) {
       if (key.startsWith(prefix)) {
@@ -453,6 +614,7 @@ export class Scheduler {
         cleared = true;
       }
     }
+    if (cleared) this._scheduleSaveState();
     return cleared;
   }
 
@@ -464,6 +626,8 @@ export class Scheduler {
     this.circuitBreakers.clear();
     this.modelBreakers.clear();
     this.routeModelBreakers.clear();
+    this.consecutiveFails.clear();
+    if (count > 0) this._scheduleSaveState();
     return count;
   }
 
@@ -948,6 +1112,45 @@ export class Scheduler {
     return results;
   }
 
+  /**
+   * 对所有国内账号批量执行开学季活动（领任务 + 自动点灯 + 领积分 + 大转盘抽奖，保留手动停用账号参与）
+   */
+  async runAllSchool(options = {}) {
+    const accounts = this.store.getAll().filter((a) => !a.disabled && a.auth?.realm !== 'global');
+    const results = [];
+    for (const acc of accounts) {
+      try {
+        const res = await runSchoolActivity(acc, options);
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...res });
+      } catch (err) {
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: false, error: err.message });
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    return results;
+  }
+
+  /**
+   * 对所有国内账号在 CST 23:00-08:00 窗口批量执行「深夜猫猫 / black_cat」任务
+   */
+  async runAllNightCat(now = new Date()) {
+    if (!isCSTNightWindow(now)) {
+      return [];
+    }
+    const accounts = this.store.getAll().filter((a) => !a.disabled && a.auth?.realm !== 'global');
+    const results = [];
+    for (const acc of accounts) {
+      try {
+        const res = await runNightCatTask(acc);
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...res });
+      } catch (err) {
+        results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ok: false, error: err.message });
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return results;
+  }
+
   async _runScheduledHourTick() {
     const cfg = this.configStore ? this.configStore.getAll() : {};
     const sched = cfg.schedule || {};
@@ -973,15 +1176,23 @@ export class Scheduler {
     if (sched.tasksEnabled !== false && cfg.autoTasks !== false && (sched.tasksHours || [11]).includes(hour)) {
       oncePerSlot('tasks', () => this.runAllTasks());
     }
+    if (sched.schoolEnabled !== false && (sched.schoolHours || [12]).includes(hour)) {
+      oncePerSlot('school', () => this.runAllSchool());
+    }
+    if (sched.catEnabled !== false && (sched.catHours || [1]).includes(hour) && isCSTNightWindow()) {
+      oncePerSlot('nightcat', () => this.runAllNightCat());
+    }
     if (sched.keepaliveEnabled !== false && cfg.autoRefreshToken !== false && (sched.keepaliveHours || [22]).includes(hour)) {
       oncePerSlot('keepalive', () => this.refreshAllTokens(false));
     }
   }
 
   /**
-   * 启动后台自动化排程任务（定时小时排程 + 保活刷新 + 兜底巡检）
+   * 启动后台自动化排程任务（定时小时排程 + 保活刷新 + 兜底巡检 + auths 热监听）
    */
   startAutoRoutines(intervalMs = 2 * 60 * 60 * 1000) {
+    this.store?.startAuthDirWatch?.(5000);
+
     if (!this.scheduleTimer) {
       this.scheduleTimer = setInterval(() => {
         this._runScheduledHourTick().catch(() => {});
@@ -1024,6 +1235,10 @@ export class Scheduler {
    * 停止后台自动化排程与保活定时器
    */
   stopAutoRoutines() {
+    this.store?.stopAuthDirWatch?.();
+    if (this._stateSaveTimer) {
+      this.flushState();
+    }
     if (this.scheduleTimer) {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;

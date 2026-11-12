@@ -90,7 +90,7 @@ export function SettingsCard({ t }) {
   const [webPasswordDraft, setWebPasswordDraft] = useState('');
   const [ipWlDraft, setIpWlDraft] = useState({ enabled: false, allowLocalhost: true, text: '' });
   const [alertsDraft, setAlertsDraft] = useState({ enabled: false, minCredit: 50, webhooksText: '', events: ['ban', '401', 'cooling', 'low_credit'] });
-  const [schedDraft, setSchedDraft] = useState({ checkin: '9, 21', travel: '9, 21', tasks: '11', keepalive: '22' });
+  const [schedDraft, setSchedDraft] = useState({ checkin: '9, 21', travel: '9, 21', tasks: '11', school: '12', cat: '1', keepalive: '22' });
   const [usersList, setUsersList] = useState([]);
   const [newUserDraft, setNewUserDraft] = useState({ username: '', password: '', role: 'user', dailyCreditLimit: 0, rpm: 0 });
 
@@ -129,6 +129,8 @@ export function SettingsCard({ t }) {
             checkin: (sch.checkinHours || [9, 21]).join(', '),
             travel: (sch.travelHours || [9, 21]).join(', '),
             tasks: (sch.tasksHours || [11]).join(', '),
+            school: (sch.schoolHours || [12]).join(', '),
+            cat: (sch.catHours || [1]).join(', '),
             keepalive: (sch.keepaliveHours || [22]).join(', ')
           });
         }
@@ -994,6 +996,51 @@ export function SettingsCard({ t }) {
             >
               全量国内号自动跑任务
             </button>
+            <button
+              className="wb2a-btn wb2a-btn-sm"
+              disabled={loading}
+              onClick={async () => {
+                setLoading(true);
+                try {
+                  const res = await fetch('/plugins/dsh-workbuddy2api/school/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uid: selectedUid || status?.activeUid })
+                  });
+                  const d = await res.json();
+                  const r = d.result || {};
+                  setActionMsg(`🏫 ${r.summary || `开学季: 完成 ${r.logs?.length || 0} 步, 抽奖 ${r.prizes?.length || 0} 次 (+${r.creditGained || 0} 分)`}`);
+                  await fetchStatus(true);
+                  notifyBalanceUpdate();
+                } finally {
+                  setLoading(false);
+                }
+              }}
+            >
+              🏫 开学季活动+抽奖
+            </button>
+            <button
+              className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm"
+              disabled={loading}
+              onClick={async () => {
+                setLoading(true);
+                try {
+                  const res = await fetch('/plugins/dsh-workbuddy2api/school/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ all: true })
+                  });
+                  const d = await res.json();
+                  setActionMsg(`🎓 全号开学季已完成 (${d.results?.length || 0} 账号)`);
+                  await fetchStatus(true);
+                  notifyBalanceUpdate();
+                } finally {
+                  setLoading(false);
+                }
+              }}
+            >
+              🎓 全号开学季抽奖
+            </button>
             <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" onClick={() => fetchTasksPanel()}>
               ↻ 刷新清单
             </button>
@@ -1638,7 +1685,7 @@ export function SettingsCard({ t }) {
               value={alertsDraft.webhooksText}
               onChange={(e) => setAlertsDraft({ ...alertsDraft, webhooksText: e.target.value })}
             />
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr auto', gap: 6, alignItems: 'end' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr) auto', gap: 6, alignItems: 'end' }}>
               <div>
                 <div style={{ fontSize: 10, color: '#64748b' }}>签到小时</div>
                 <input className="wb2a-input" value={schedDraft.checkin} onChange={(e) => setSchedDraft({ ...schedDraft, checkin: e.target.value })} />
@@ -1650,6 +1697,14 @@ export function SettingsCard({ t }) {
               <div>
                 <div style={{ fontSize: 10, color: '#64748b' }}>任务小时</div>
                 <input className="wb2a-input" value={schedDraft.tasks} onChange={(e) => setSchedDraft({ ...schedDraft, tasks: e.target.value })} />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>开学季小时</div>
+                <input className="wb2a-input" value={schedDraft.school} onChange={(e) => setSchedDraft({ ...schedDraft, school: e.target.value })} />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>夜猫小时</div>
+                <input className="wb2a-input" value={schedDraft.cat} onChange={(e) => setSchedDraft({ ...schedDraft, cat: e.target.value })} />
               </div>
               <div>
                 <div style={{ fontSize: 10, color: '#64748b' }}>保活小时</div>
@@ -1667,6 +1722,8 @@ export function SettingsCard({ t }) {
                         checkinHours: p(schedDraft.checkin),
                         travelHours: p(schedDraft.travel),
                         tasksHours: p(schedDraft.tasks),
+                        schoolHours: p(schedDraft.school),
+                        catHours: p(schedDraft.cat),
                         keepaliveHours: p(schedDraft.keepalive)
                       }
                     })

@@ -24,6 +24,36 @@ const OFFICIAL_VENDOR_PRIORITY = [
   'tencent'
 ];
 
+const OFFICIAL_SEED_LIMITS = {
+  'glm-5.2': { ctx: 1000000, max: 131072 },
+  'glm-5.1': { ctx: 200000, max: 131072 },
+  'glm-5.3': { ctx: 1000000, max: 131072 },
+  'glm-5.3-flash': { ctx: 1000000, max: 131072 },
+  'glm-5v-turbo': { ctx: 200000, max: 131072 },
+  'kimi-k2.7': { ctx: 256000, max: 65536 },
+  'kimi-k2.6': { ctx: 256000, max: 262144 },
+  'kimi-k2.5': { ctx: 164000, max: 262144 },
+  'kimi-k3': { ctx: 1048576, max: 131072 },
+  'kimi-k2.8-preview': { ctx: 1048576, max: 131072 },
+  'minimax-m3': { ctx: 512000, max: 512000 },
+  'hy3': { ctx: 192000, max: 64000 },
+  'hy3-preview': { ctx: 262144, max: 64000 },
+  'hy4-preview': { ctx: 1000000, max: 64000 },
+  'hy4-preview-x': { ctx: 1000000, max: 64000 },
+  'deepseek-v4-pro': { ctx: 1000000, max: 384000 },
+  'deepseek-v4-flash': { ctx: 1000000, max: 384000 },
+  'deepseek-v4.1-flash': { ctx: 1000000, max: 384000 },
+  'gpt-6-astra': { ctx: 1050000, max: 128000 },
+  'gpt-5.6-sol': { ctx: 1050000, max: 128000 },
+  'gpt-5.6-terra': { ctx: 1050000, max: 128000 },
+  'gpt-5.6-luna': { ctx: 1050000, max: 128000 },
+  'gpt-5.5': { ctx: 1050000, max: 128000 },
+  'gpt-5.4': { ctx: 1050000, max: 128000 },
+  'gpt-5.3-codex': { ctx: 400000, max: 128000 },
+  'gemini-3.5-flash': { ctx: 1048576, max: 65536 },
+  'auto': { ctx: 168000, max: 32000 }
+};
+
 const CURATED_LIMITS = [
   { match: /^claude-/, ctx: 200000, max: 64000 },
   { match: /^gpt-5|^gpt-6/, ctx: 400000, max: 128000 },
@@ -86,6 +116,15 @@ export class ModelCatalogEnricher {
     }
 
     const bare = stripPrefix(modelId);
+
+    // 1.5 官方 model.json 精确种子上限表
+    const exactSeed = OFFICIAL_SEED_LIMITS[bare];
+    if (exactSeed) {
+      return {
+        contextWindow: exactSeed.ctx,
+        maxTokens: upstreamMax > 0 ? upstreamMax : exactSeed.max
+      };
+    }
 
     // 2. 本地已缓存的 models.dev 结果
     const cached = this.cache[bare];

@@ -41,7 +41,7 @@ export const PROVIDER_NAME = 'workbuddy';
 export const PROVIDER_ALIAS = 'workbuddy2api';
 export const SETTINGS_NS = 'settings.workbuddy2api';
 export const SIDEBAR_PANEL_ID = 'workbuddy2api-panel';
-export const SERVICE_VERSION = '1.2.0';
+export const SERVICE_VERSION = '1.3.0';
 export const GITHUB_REPO = 'XCool-603/dsh-workbuddy2api';
 
 export const DEFAULT_GATEWAY_PORT = 7863;

@@ -32,6 +32,10 @@ import {
   fetchGrowthTasks,
   runAllGrowthTasks
 } from '../src/upstream/tasks.js';
+import {
+  fetchSchoolStatus,
+  runSchoolActivity
+} from '../src/upstream/school.js';
 import { STATIC_MODELS } from '../src/constants.js';
 
 const [,, cmd, ...args] = process.argv;
@@ -317,6 +321,30 @@ async function main() {
       break;
     }
 
+    case 'school': {
+      const sub = args.find((a) => !a.startsWith('-')) || 'run';
+      const runAll = args.includes('--all');
+      if (runAll) {
+        const cnAccs = store.getAll().filter((a) => !a.disabled && a.auth?.realm !== 'global');
+        const results = [];
+        for (const acc of cnAccs) {
+          const r = sub === 'status' ? await fetchSchoolStatus(acc) : await runSchoolActivity(acc);
+          results.push({ uid: acc.account.uid, nickname: acc.account.nickname, ...r });
+          console.log(`• ${acc.account.nickname} (${acc.account.uid}): ${JSON.stringify(r)}`);
+        }
+        if (isJson) console.log(JSON.stringify(results, null, 2));
+        break;
+      }
+      const active = store.getActive();
+      if (!active) {
+        console.error('❌ 账号池无可用账号');
+        process.exit(1);
+      }
+      const res = sub === 'status' ? await fetchSchoolStatus(active) : await runSchoolActivity(active);
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
     case 'trial': {
       const globals = store.getAll().filter((a) => a.auth?.realm === 'global');
       if (globals.length === 0) {
@@ -460,6 +488,7 @@ DSH WorkBuddy 2API CLI 命令行工具
   travel [subcmd]      🐱 猫猫旅行管家 (status / depart / claim / run)
   welfare [subcmd]     🎁 活动福利体系 (claim / streak / draw)
   tasks [subcmd]       📋 成长任务引擎 (list / run - 自动点亮+领奖)
+  school [status|run]  🏫 开学季活动盘点、点灯、领奖与大转盘抽奖 (--all 全池)
   alerts-test          🔔 发送一次测试 Webhook 风控告警
   accounts             列出账号池内所有已保存的账号
   doctor               不泄露密钥的环境与存储健康检查

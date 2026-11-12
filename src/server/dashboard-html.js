@@ -443,8 +443,11 @@ export function renderConsoleHtml(opts = {}) {
         <select id="tasksUidSelect" onchange="loadTasks()"></select>
         <button class="btn btn-green" onclick="runTasks(false)">一键全自动点亮并收割</button>
         <button class="btn btn-amber" onclick="runTasks(true)">全量国内号一键自动化任务</button>
+        <button class="btn btn-primary" onclick="runSchoolActivity(false)">🏫 开学季活动+抽奖 (单号)</button>
+        <button class="btn" onclick="runSchoolActivity(true)">🎓 全号开学季抽奖</button>
         <button class="btn" onclick="loadTasks()">↻ 刷新任务列表</button>
       </div>
+      <pre class="code hidden" id="schoolLog" style="margin-bottom:10px"></pre>
       <div class="card">
         <div class="card-title"><span>全自动成长积分任务清单 (18+ 项)</span><span id="tasksSummary"></span></div>
         <div id="tasksList"></div>
@@ -493,6 +496,8 @@ export function renderConsoleHtml(opts = {}) {
             <div class="form-field"><label>签到福利小时 (逗号):</label><input id="schCheckin" placeholder="9, 21" /></div>
             <div class="form-field"><label>猫猫旅行小时 (逗号):</label><input id="schTravel" placeholder="9, 21" /></div>
             <div class="form-field"><label>成长任务小时 (逗号):</label><input id="schTasks" placeholder="11" /></div>
+            <div class="form-field"><label>开学季活动小时 (逗号):</label><input id="schSchool" placeholder="12" /></div>
+            <div class="form-field"><label>深夜猫猫小时 (23-08):</label><input id="schCat" placeholder="1" /></div>
             <div class="form-field"><label>全池保活小时 (逗号):</label><input id="schKeepalive" placeholder="22" /></div>
           </div>
         </div>
@@ -991,6 +996,18 @@ export function renderConsoleHtml(opts = {}) {
       listEl.innerHTML = items.map(t => '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e2e8f0;font-size:12px"><div><strong>' + escapeHtml(t.name || t.title || t.code) + '</strong> <span style="color:var(--text-dim)">(' + escapeHtml(t.code || '') + ')</span></div><div><span class="tag ' + (t.claimed ? 'tag-cn' : t.completed ? 'tag-warn' : 'tag-err') + '">' + (t.claimed ? '已领奖' : t.completed ? '待领取' : '待触发') + '</span></div></div>').join('') || '<div class="sub-row">当前账号暂无可查询成长任务</div>';
     }
     async function runTasks(all) { const uid = document.getElementById('tasksUidSelect').value || state.activeUid; toast('正在执行成长任务...'); await api('/tasks/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, all }) }); toast('任务完成'); loadTasks(); loadStatus(true); }
+    async function runSchoolActivity(all) {
+      const uid = document.getElementById('tasksUidSelect').value || state.activeUid;
+      toast(all ? '正在全池巡检开学季活动与转盘抽奖...' : '正在执行单号开学季活动与转盘抽奖...');
+      const res = await api('/school/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, all }) });
+      const logEl = document.getElementById('schoolLog');
+      if (logEl) {
+        logEl.classList.remove('hidden');
+        logEl.textContent = JSON.stringify(res, null, 2);
+      }
+      toast('开学季活动与抽奖完成');
+      loadStatus(true);
+    }
 
     function rateBadgeHtml(m) {
       const rate = m?.rate || '-';
@@ -1197,6 +1214,8 @@ export function renderConsoleHtml(opts = {}) {
       document.getElementById('schCheckin').value = (sch.checkinHours || [9,21]).join(', ');
       document.getElementById('schTravel').value = (sch.travelHours || [9,21]).join(', ');
       document.getElementById('schTasks').value = (sch.tasksHours || [11]).join(', ');
+      document.getElementById('schSchool').value = (sch.schoolHours || [12]).join(', ');
+      document.getElementById('schCat').value = (sch.catHours || [1]).join(', ');
       document.getElementById('schKeepalive').value = (sch.keepaliveHours || [22]).join(', ');
 
       document.getElementById('pwStatusBadge').textContent = state.auth?.hasPassword ? '已开启密码锁定' : '免密单机模式';
@@ -1252,6 +1271,8 @@ export function renderConsoleHtml(opts = {}) {
             checkinHours: parseHrs('schCheckin'),
             travelHours: parseHrs('schTravel'),
             tasksHours: parseHrs('schTasks'),
+            schoolHours: parseHrs('schSchool'),
+            catHours: parseHrs('schCat'),
             keepaliveHours: parseHrs('schKeepalive')
           }
         })

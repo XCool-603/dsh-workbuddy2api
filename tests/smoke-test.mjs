@@ -41,6 +41,16 @@ import { checkIPWhitelist, parseWhitelistEntries } from '../src/server/ip-whitel
 import { UserManager } from '../src/server/auth-users.js';
 import { AlertManager } from '../src/server/alerts.js';
 import { renderConsoleHtml, renderPortalHtml } from '../src/server/dashboard-html.js';
+import {
+  stickyFallbackKey,
+  turnKey,
+  deriveTurnRequestId,
+  uuidForKey
+} from '../src/upstream/session.js';
+import { ModelCatalogEnricher } from '../src/upstream/model-catalog.js';
+import { createAnthropicStreamEmitter } from '../src/server/messages.js';
+import { runSchoolActivity, fetchSchoolStatus } from '../src/upstream/school.js';
+import { isCSTNightWindow, TASK_MAPPING } from '../src/upstream/tasks.js';
 import vm from 'node:vm';
 
 console.log('🧪 开始执行 WorkBuddy 2API 自动化冒烟测试...\n');
@@ -710,4 +720,198 @@ assert.ok(alertRes.ok && hookPayloads[0].msg_type === 'text', '飞书 Webhook �
 fs.rmSync(tmpHome4, { recursive: true, force: true });
 console.log('   ✓ IP/CIDR 白名单防伪造、多租户 RPM/日限额与 Webhook 告警测试通过');
 
-console.log('\n🎉 所有 21 项自动化全功能验证测试全部通过！');
+// 22. 测试 Session Sticky 兜底/轮级 ID、model.json 种子表、Singleflight Refresh 与 Anthropic 扩展
+console.log('22. 测试 Session 亲和派生、model.json 上限表、Token 单飞与 Anthropic count_tokens/流式错帧...');
+const fb1 = stickyFallbackKey({ messages: [{ role: 'user', content: 'Build my app' }] });
+const fb2 = stickyFallbackKey({ messages: [{ role: 'user', content: 'Build my app' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'next' }] });
+assert.ok(fb1.startsWith('fb:') && fb1 === fb2, '同一对话首条消息派生的 Sticky 兜底键必须保持一致');
+assert.strictEqual(stickyFallbackKey({ metadata: { user_id: 'u-1' }, messages: [{ role: 'user', content: 'Build' }] }), '', '带 user_id 不得使用全局兜底键');
+
+const tk1 = turnKey({ messages: [{ role: 'user', content: 'run tests' }] });
+const tk2 = turnKey({ messages: [{ role: 'user', content: 'run tests' }, { role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] }, { role: 'tool', tool_call_id: 'c1', content: 'ok' }] });
+assert.strictEqual(tk1, tk2, '同一用户轮次内的 tool_call 续接必须保持相同 TurnKey');
+assert.strictEqual(deriveTurnRequestId(fb1, tk1), deriveTurnRequestId(fb1, tk2), '同轮 X-Conversation-Request-ID 必须一致');
+assert.match(uuidForKey(fb1), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+
+const tmpCatDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-cat-'));
+const enricher = new ModelCatalogEnricher({ dshHome: tmpCatDir });
+assert.deepStrictEqual(enricher.lookupLimits('cn:deepseek-v4-pro'), { contextWindow: 1000000, maxTokens: 384000 });
+assert.deepStrictEqual(enricher.lookupLimits('global:gpt-5.3-codex'), { contextWindow: 400000, maxTokens: 128000 });
+assert.deepStrictEqual(enricher.lookupLimits('kimi-k2.6'), { contextWindow: 256000, maxTokens: 262144 });
+
+// Singleflight refresh 测试
+let refreshCalls = 0;
+const origFetch = globalThis.fetch;
+globalThis.fetch = async (url, opts) => {
+  if (String(url).includes('/v2/plugin/auth/token/refresh')) {
+    refreshCalls++;
+    await new Promise((r) => setTimeout(r, 30));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ code: 0, data: { accessToken: 'new-acc-tok', refreshToken: 'new-ref-tok', expiresIn: 7200 } })
+    };
+  }
+  return origFetch(url, opts);
+};
+try {
+  const sfClient = new UpstreamClient();
+  const sfAcc = { account: { uid: 'uid-sf-1', nickname: 'sf' }, auth: { realm: 'cn', accessToken: 'old', refreshToken: 'ref-1' } };
+  await Promise.all([sfClient.refreshToken(sfAcc), sfClient.refreshToken(sfAcc), sfClient.refreshToken(sfAcc)]);
+  assert.strictEqual(refreshCalls, 1, '同 UID 并发 refreshToken 必须单飞去重为 1 次上游调用');
+  assert.strictEqual(sfAcc.auth.accessToken, 'new-acc-tok');
+} finally {
+  globalThis.fetch = origFetch;
+}
+
+// Anthropic mid-stream error 帧与 /v1/messages/count_tokens
+let sseBuf = '';
+let sseEnded = false;
+const mockRes2 = {
+  headersSent: false,
+  writableEnded: false,
+  writeHead: () => { mockRes2.headersSent = true; },
+  write: (s) => { sseBuf += s; },
+  end: () => { sseEnded = true; mockRes2.writableEnded = true; }
+};
+const antEmitter = createAnthropicStreamEmitter(mockRes2, 'claude-sonnet-4-6');
+antEmitter.pushOpenAIEvent({ choices: [{ delta: { content: 'hi' } }] });
+antEmitter.pushOpenAIEvent({ error: { message: 'quota hit', type: 'rate_limit_error', gateway_hint: 'all cooling' } });
+assert.ok(sseEnded && sseBuf.includes('event: error') && sseBuf.includes('gateway_hint'), 'Anthropic 流中遇到上游 error 帧必须输出 event: error 并关闭流');
+
+const tmpHome5 = fs.mkdtempSync(path.join(os.tmpdir(), 'wb2a-w2-'));
+const cfg5 = new ConfigStore({}, { dshHome: tmpHome5 });
+const store5 = new AccountStore({ dshHome: tmpHome5, skipDiscovery: true });
+store5.upsert({ account: { uid: 'u-w2-1', nickname: 'w2' }, auth: { realm: 'cn', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 999999 } });
+const sched5 = new Scheduler(store5, { configStore: cfg5, dshHome: tmpHome5 });
+const gw5 = new LoopbackGateway({ preferredPort: 0, scheduler: sched5, client: new UpstreamClient(), ledger: new UsageLedger({ filePath: path.join(tmpHome5, 'l.json') }), configStore: cfg5 });
+const p5 = await gw5.start();
+const ctRes = await fetch(`http://127.0.0.1:${p5}/v1/messages/count_tokens`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    system: 'You are concise.',
+    messages: [{ role: 'user', content: 'Hello world 中文测试' }]
+  })
+});
+const ctJson = await ctRes.json();
+assert.ok(ctRes.ok && typeof ctJson.input_tokens === 'number' && ctJson.input_tokens > 5, '/v1/messages/count_tokens 必须返回正整数估算 Token 数');
+gw5.stop();
+fs.rmSync(tmpCatDir, { recursive: true, force: true });
+console.log('   ✓ Session 亲和、model.json 上限表、Token 单飞与 Anthropic count_tokens/错帧测试通过');
+
+// 23. 测试状态持久化 (.workbuddy2api-state.json)、NoteFailures 5次阈值、积分自动复活与 auths 热重载
+console.log('23. 测试状态持久化、NoteFailures 瞬态保护、积分恢复与 auths 目录热重载...');
+const tmpAuthWatch = path.join(tmpHome5, 'workbuddy2api-auths');
+fs.mkdirSync(tmpAuthWatch, { recursive: true });
+for (let i = 1; i <= 4; i++) {
+  sched5.recordFailure(store5.get('u-w2-1'), ErrKind.CLIENT, `net err ${i}`);
+  assert.strictEqual(sched5.isCoolingDown('u-w2-1'), false, '前 4 次瞬态异常不得立刻触发账号冷却');
+}
+sched5.recordFailure(store5.get('u-w2-1'), ErrKind.CLIENT, 'net err 5');
+assert.strictEqual(sched5.isCoolingDown('u-w2-1'), true, '第 5 次瞬态异常应触发 300s 临时降级');
+
+store5.upsert({ account: { uid: 'u-w2-2', nickname: 'credit-acct' }, auth: { realm: 'cn', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 999999 } });
+sched5.recordFailure(store5.get('u-w2-2'), ErrKind.HARD_CREDIT, 'no credit');
+assert.strictEqual(sched5.isCoolingDown('u-w2-2'), true);
+assert.strictEqual(sched5.reenableIfCredits('u-w2-2', 50), true, '检测到有效余额 > 0 应自动解除 HARD_CREDIT 冷却');
+assert.strictEqual(sched5.isCoolingDown('u-w2-2'), false);
+
+// 持久化状态保存与恢复验证
+sched5.cooldownFreeQuotaModel('u-w2-1', Date.now() + 3600000, 'glm-4.6', 'quota exhausted');
+sched5.flushState();
+const sched5Reloaded = new Scheduler(store5, { configStore: cfg5, dshHome: tmpHome5 });
+assert.strictEqual(sched5Reloaded.isCoolingDown('u-w2-1', 'glm-4.6'), true, '重启后新建 Scheduler 应从 .workbuddy2api-state.json 恢复未过期模型冷却');
+
+// manualDisabled 不影响福利/签到/任务名单
+store5.setManualDisabled('u-w2-2', true, 'ops-pause');
+assert.strictEqual(store5.isAccountUnavailable(store5.get('u-w2-2')), true);
+assert.strictEqual(store5.getAll().filter((a) => !a.disabled).length, 2, 'manualDisabled 账号不得设置 disabled=true，仍保留福利/保活资格');
+
+// auths 目录热重载验证
+fs.writeFileSync(
+  path.join(tmpAuthWatch, 'cn-hotdrop.json'),
+  JSON.stringify({ uid: 'u-hot-99', nickname: 'HotDrop', realm: 'cn', accessToken: 'tok-hot-1', refreshToken: 'ref-hot-1' }),
+  'utf8'
+);
+const hotRes = store5.scanAuthDirsOnce();
+assert.ok(hotRes.changed && hotRes.added === 1 && store5.get('u-hot-99')?.auth?.accessToken === 'tok-hot-1', 'auths 热扫描应自动导入新落盘凭证');
+// 更新已有文件 token 且不覆盖 manualDisabled
+store5.setManualDisabled('u-hot-99', true, 'keep-manual');
+await new Promise((r) => setTimeout(r, 20));
+fs.writeFileSync(
+  path.join(tmpAuthWatch, 'cn-hotdrop.json'),
+  JSON.stringify({ uid: 'u-hot-99', nickname: 'HotDrop', realm: 'cn', accessToken: 'tok-hot-2', refreshToken: 'ref-hot-2' }),
+  'utf8'
+);
+const hotUpd = store5.scanAuthDirsOnce();
+assert.ok(hotUpd.updated === 1 && store5.get('u-hot-99').auth.accessToken === 'tok-hot-2' && store5.get('u-hot-99').manualDisabled === true, '热重载更新 Token 时必须保留原有 manualDisabled 状态');
+sched5.stopAutoRoutines();
+sched5Reloaded.stopAutoRoutines();
+console.log('   ✓ 运行态持久化、NoteFailures 5次阈值、积分自动解冻与 auths 热重载测试通过');
+
+// 24. 测试开学季活动引擎、扩展成长任务映射、CST夜猫窗口、/school/status 路由与 Console JS 编译
+console.log('24. 测试开学季活动/转盘引擎、扩展成长任务映射与 Console JS 语法...');
+assert.strictEqual(isCSTNightWindow(new Date('2026-04-12T17:00:00Z')), true, 'UTC 17:00 = CST 01:00 应命中夜猫窗口');
+assert.strictEqual(isCSTNightWindow(new Date('2026-04-12T04:00:00Z')), false, 'UTC 04:00 = CST 12:00 不得命中夜猫窗口');
+for (const k of ['first_buddy', 'skill_share', 'Sequential_Tasks_1', 'school_season']) {
+  assert.ok(TASK_MAPPING[k], `TASK_MAPPING 必须包含 ${k}`);
+}
+
+let drawSeq = 0;
+const mockSchoolFetch = async (url) => {
+  const u = String(url);
+  if (u.endsWith('/school/tasks')) {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        code: 0,
+        data: {
+          in_period: true,
+          tasks: [
+            { task_code: 'share_invite', status: 'pending' },
+            { task_code: 'chat_3_times', status: 'in_progress', target_count: 2, progress: 1 }
+          ]
+        }
+      })
+    };
+  }
+  if (u.endsWith('/school/config')) {
+    return { ok: true, status: 200, json: async () => ({ code: 0, data: { chance: { balance: 2 } } }) };
+  }
+  if (u.endsWith('/wheel/draw')) {
+    drawSeq++;
+    if (drawSeq === 1) {
+      return { ok: true, status: 200, json: async () => ({ code: 0, data: { prize_code: 'school_credit_66', credit_amount: 66, chance_balance: 1 } }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ code: 40900, message: 'no chances' }) };
+  }
+  return { ok: true, status: 200, json: async () => ({ code: 0, data: {} }) };
+};
+const skippedSchool = await fetchSchoolStatus({ account: { uid: 'u-gl-1' }, auth: { realm: 'global', accessToken: 't' } });
+assert.strictEqual(skippedSchool.skipped, true, '国际版账号应自动跳过开学季活动');
+
+const schoolRes = await runSchoolActivity(
+  { account: { uid: 'u-sch-1', nickname: 'stu' }, auth: { realm: 'cn', accessToken: 'tok-s' } },
+  { fetchFn: mockSchoolFetch }
+);
+assert.strictEqual(schoolRes.ok, true);
+assert.strictEqual(schoolRes.creditGained, 66);
+assert.strictEqual(schoolRes.prizes.length, 1);
+
+// 注册包含 /school/* 的 web-routes 与 Console HTML 语法检查
+const reg6 = registerWebRoutes({}, { scheduler: sched5Reloaded, client: new UpstreamClient(), ledger: new UsageLedger({ filePath: path.join(tmpHome5, 'l2.json') }), loopback: gw5, configStore: cfg5 });
+assert.ok(reg6.routes.some((r) => r.path === '/plugins/dsh-workbuddy2api/school/status'));
+assert.ok(reg6.routes.some((r) => r.path === '/plugins/dsh-workbuddy2api/school/run'));
+const htmlW2 = renderConsoleHtml({ port: p5 });
+assert.ok(htmlW2.includes('schSchool') && htmlW2.includes('schCat') && htmlW2.includes('runSchoolActivity'));
+const sm2 = htmlW2.match(/<script>([\s\S]*?)<\/script>/);
+assert.ok(sm2 && sm2[1], 'Console HTML 必须包含完整脚本');
+new vm.Script(sm2[1]);
+
+fs.rmSync(tmpHome5, { recursive: true, force: true });
+console.log('   ✓ 开学季活动/抽奖、夜猫窗口、4项扩展成长任务与 Console JS 语法测试通过');
+
+console.log('\n🎉 所有 24 项自动化全功能验证测试全部通过！');

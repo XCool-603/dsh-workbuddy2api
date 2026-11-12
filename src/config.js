@@ -11,11 +11,15 @@ export const defaultScheduleConfig = {
   checkinHours: [9, 21],
   travelHours: [9, 21],
   tasksHours: [11],
+  schoolHours: [12],
+  catHours: [1],
   keepaliveHours: [22],
   activityReportCount: 5,
   checkinEnabled: true,
   travelEnabled: true,
   tasksEnabled: true,
+  schoolEnabled: true,
+  catEnabled: true,
   keepaliveEnabled: true
 };
 
@@ -93,6 +97,8 @@ export function unwrapConfig(raw) {
       checkinHours: normalizeHoursList(schedIn.checkinHours, defaultScheduleConfig.checkinHours),
       travelHours: normalizeHoursList(schedIn.travelHours, defaultScheduleConfig.travelHours),
       tasksHours: normalizeHoursList(schedIn.tasksHours, defaultScheduleConfig.tasksHours),
+      schoolHours: normalizeHoursList(schedIn.schoolHours, defaultScheduleConfig.schoolHours),
+      catHours: normalizeHoursList(schedIn.catHours, defaultScheduleConfig.catHours),
       keepaliveHours: normalizeHoursList(schedIn.keepaliveHours, defaultScheduleConfig.keepaliveHours),
       activityReportCount: Math.max(1, Number(schedIn.activityReportCount ?? defaultScheduleConfig.activityReportCount) || 5)
     },
