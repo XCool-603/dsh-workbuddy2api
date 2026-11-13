@@ -93,14 +93,39 @@ export async function activate(context) {
   async function refreshStatusBar() {
     if (gatewayMode === 'stopped') {
       statusBar.text = '$(circle-slash) WB2API 未启动';
+      statusBar.tooltip = 'WorkBuddy 2API 网关未启动 (点击启动并打开控制台)';
       return;
     }
     const pub = await fetchStatusJson(activePort);
     if (pub && pub.ok) {
-      statusBar.text = `$(zap) WB2API :${activePort} · ${pub.healthy || 0}/${pub.total || 0} 号`;
-      statusBar.tooltip = `WorkBuddy 2API (${gatewayMode === 'attached' ? '外部接管' : '内置运行'}) | 健康 ${pub.healthy}/${pub.total} | 点击打开全功能控制台`;
+      const pointText = typeof pub.remain === 'number' && pub.remain > 0
+        ? (pub.remain >= 10000 ? `${(pub.remain / 1000).toFixed(1)}k` : String(pub.remain))
+        : null;
+      statusBar.text = `$(zap) WB2API :${activePort} · ${pub.healthy || 0}/${pub.total || 0}号${pointText ? ` · $(database) ${pointText}` : ''}`;
+
+      if (typeof vscode.MarkdownString === 'function') {
+        const md = new vscode.MarkdownString();
+        md.isTrusted = true;
+        md.supportHtml = true;
+        md.appendMarkdown(`### ⚡ WorkBuddy 2API 网关服务\n\n`);
+        md.appendMarkdown(`- **运行模式**: \`${gatewayMode === 'attached' ? '外部网关接管' : '内置网关运行'}\`\n`);
+        md.appendMarkdown(`- **服务端口**: \`127.0.0.1:${activePort}\`\n`);
+        md.appendMarkdown(`- **可用账号**: \`${pub.healthy || 0} / ${pub.total || 0}\` 个正常在线\n`);
+        if (typeof pub.remain === 'number') {
+          md.appendMarkdown(`- **全池积分**: **${pub.remain.toLocaleString()}** 积分\n`);
+        }
+        if (pub.cooling > 0) {
+          md.appendMarkdown(`- **熔断保护**: \`${pub.cooling}\` 个账号处于冷却降级\n`);
+        }
+        md.appendMarkdown(`\n---\n`);
+        md.appendMarkdown(`[🖥️ 打开控制台](command:workbuddy2api.openConsole) &nbsp;|&nbsp; [🌐 浏览器打开](command:workbuddy2api.openBrowser) &nbsp;|&nbsp; [📋 复制接入配置](command:workbuddy2api.copyEndpoints) &nbsp;|&nbsp; [📅 全池签到](command:workbuddy2api.checkinAll)`);
+        statusBar.tooltip = md;
+      } else {
+        statusBar.tooltip = `WorkBuddy 2API (${gatewayMode === 'attached' ? '外部接管' : '内置运行'}) | 健康 ${pub.healthy}/${pub.total} | 点击打开全功能控制台`;
+      }
     } else {
       statusBar.text = `$(zap) WB2API :${activePort}`;
+      statusBar.tooltip = `WorkBuddy 2API 网关运行于 :${activePort} (点击打开控制台)`;
     }
   }
 

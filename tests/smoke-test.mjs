@@ -949,6 +949,10 @@ const postedFromPanel = [];
 const mockVscode = {
   ViewColumn: { One: 1 },
   StatusBarAlignment: { Right: 2 },
+  MarkdownString: class {
+    constructor(val = '') { this.value = val; this.isTrusted = false; this.supportHtml = false; }
+    appendMarkdown(s) { this.value += s; return this; }
+  },
   Uri: { parse: (s) => ({ toString: () => s }), file: (s) => ({ fsPath: s }) },
   workspace: {
     getConfiguration: () => ({

@@ -15,21 +15,24 @@ export function renderSidebarHtml(opts = {}) {
   <title>WorkBuddy 2API</title>
   <style>
     :root {
-      --bg: #f4f7fb;
-      --card: #ffffff;
-      --soft: #f8fafc;
-      --border: #dbe5f1;
-      --blue: #2563eb;
+      --bg: var(--vscode-sideBar-background, #f4f7fb);
+      --card: var(--vscode-editorWidget-background, var(--vscode-sideBarSectionHeader-background, #ffffff));
+      --soft: var(--vscode-editor-inactiveSelectionBackground, rgba(148, 163, 184, 0.08));
+      --border: var(--vscode-widget-border, var(--vscode-sideBar-border, #dbe5f1));
+      --blue: var(--vscode-textLink-foreground, #2563eb);
       --green: #059669;
       --amber: #d97706;
       --red: #dc2626;
-      --text: #0f172a;
-      --dim: #64748b;
+      --text: var(--vscode-sideBar-foreground, var(--vscode-foreground, #0f172a));
+      --dim: var(--vscode-descriptionForeground, #64748b);
+      --input-bg: var(--vscode-input-background, #ffffff);
+      --input-border: var(--vscode-input-border, #cbd5e1);
+      --input-fg: var(--vscode-input-foreground, var(--text));
     }
     * { box-sizing: border-box; }
     body {
       margin: 0; padding: 10px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif);
       background: var(--bg); color: var(--text); font-size: 12px;
     }
     .card {
@@ -52,6 +55,7 @@ export function renderSidebarHtml(opts = {}) {
       display: inline-flex; align-items: center; justify-content: center; gap: 4px;
       border: 1px solid #bfdbfe; background: #eff6ff; color: var(--blue);
       border-radius: 7px; padding: 6px 8px; font-size: 11px; font-weight: 600; cursor: pointer;
+      transition: all 0.15s ease;
     }
     .btn:hover { background: #dbeafe; }
     .btn-primary { background: var(--blue); color: #ffffff; border-color: var(--blue); }
@@ -62,8 +66,8 @@ export function renderSidebarHtml(opts = {}) {
     .btn-block { width: 100%; }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     input, select, textarea {
-      width: 100%; padding: 6px 8px; border-radius: 7px; border: 1px solid #cbd5e1;
-      font-size: 11px; color: var(--text); background: #fff; font-family: inherit;
+      width: 100%; padding: 6px 8px; border-radius: 7px; border: 1px solid var(--input-border);
+      font-size: 11px; color: var(--input-fg); background: var(--input-bg); font-family: inherit;
     }
     .msg-box {
       font-size: 11px; padding: 7px 9px; border-radius: 8px; background: #eff6ff;
@@ -72,9 +76,69 @@ export function renderSidebarHtml(opts = {}) {
     .hidden { display: none !important; }
     .acc-item {
       display: flex; justify-content: space-between; align-items: center; gap: 6px;
-      padding: 6px 0; border-bottom: 1px solid #edf2f7; font-size: 11px;
+      padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 11px;
     }
     .acc-item:last-child { border-bottom: none; }
+    .endpoint-item {
+      background: var(--soft);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+      transition: all 0.2s;
+    }
+    .endpoint-item:hover {
+      border-color: #93c5fd;
+    }
+    .endpoint-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+      font-size: 10.5px;
+    }
+    .endpoint-name {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .endpoint-badge {
+      font-size: 9.5px;
+      color: var(--dim);
+      background: var(--card);
+      padding: 1px 5px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .endpoint-body {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 6px;
+    }
+    .endpoint-body code {
+      font-family: var(--vscode-editor-font-family, Consolas, monospace);
+      font-size: 10.5px;
+      color: var(--blue);
+      word-break: break-all;
+      user-select: all;
+    }
+    .btn-copy {
+      padding: 3px 7px;
+      font-size: 10px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .sidebar-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 4px 10px;
+      font-size: 10px;
+      color: var(--dim);
+    }
   </style>
 </head>
 <body>
@@ -139,16 +203,54 @@ export function renderSidebarHtml(opts = {}) {
     <div id="miniAccountsList" style="max-height:180px;overflow-y:auto">加载中...</div>
   </div>
 
-  <div class="card">
-    <div style="font-weight:600;font-size:12px;margin-bottom:6px">本机 API 一键接入 (适用 Cline / Roo / Claude Code)</div>
-    <div style="font-size:10.5px;color:var(--dim);margin-bottom:6px;word-break:break-all">
-      OpenAI: <code>http://127.0.0.1:${port}/v1</code><br/>
-      Anthropic: <code>http://127.0.0.1:${port}</code>
+  <div class="card" style="margin-bottom:8px">
+    <div class="row-between" style="margin-bottom:8px">
+      <strong style="font-size:12px;color:var(--text);display:flex;align-items:center;gap:5px">
+        <span>🔌</span> 本机客户端与 IDE 一键接入
+      </strong>
+      <span class="tag tag-ok">:${port}</span>
     </div>
-    <div class="grid-2">
-      <button class="btn btn-sm" onclick="copyCfg('openai')">复制 OpenAI URL</button>
-      <button class="btn btn-sm" onclick="copyCfg('claude')">复制 Claude 命令</button>
+
+    <!-- OpenAI Chat -->
+    <div class="endpoint-item">
+      <div class="endpoint-header">
+        <span class="endpoint-name">OpenAI Chat / Codex</span>
+        <span class="endpoint-badge">Cline · Roo · Cursor</span>
+      </div>
+      <div class="endpoint-body">
+        <code>http://127.0.0.1:${port}/v1</code>
+        <button class="btn btn-sm btn-copy" onclick="copyCfg('openai', this)" title="复制 Base URL">📋 复制</button>
+      </div>
     </div>
+
+    <!-- Claude Code -->
+    <div class="endpoint-item" style="margin-top:6px">
+      <div class="endpoint-header">
+        <span class="endpoint-name">Claude Code CLI</span>
+        <span class="endpoint-badge">count_tokens 优化</span>
+      </div>
+      <div class="endpoint-body">
+        <code>http://127.0.0.1:${port}</code>
+        <button class="btn btn-sm btn-copy" onclick="copyCfg('claude', this)" title="复制环境变量配置命令">📋 复制命令</button>
+      </div>
+    </div>
+
+    <!-- Codex Responses -->
+    <div class="endpoint-item" style="margin-top:6px">
+      <div class="endpoint-header">
+        <span class="endpoint-name">Codex Responses API</span>
+        <span class="endpoint-badge">/v1/responses</span>
+      </div>
+      <div class="endpoint-body">
+        <code>http://127.0.0.1:${port}/v1/responses</code>
+        <button class="btn btn-sm btn-copy" onclick="copyCfg('codex', this)" title="复制 Responses URL">📋 复制</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="sidebar-footer">
+    <span>⚡ WorkBuddy 2API · 高并发调度网关</span>
+    <a href="#" style="color:var(--blue);text-decoration:none" onclick="runCmd('workbuddy2api.restartGateway');return false;">↻ 重启网关</a>
   </div>
 
   <script>
@@ -255,11 +357,30 @@ export function renderSidebarHtml(opts = {}) {
       loadData(true);
     }
 
-    function copyCfg(kind) {
+    function copyCfg(kind, btnEl) {
+      let text = '';
+      let label = '';
       if (kind === 'openai') {
-        window.__wb2aCopyText?.('http://127.0.0.1:' + PORT + '/v1', 'OpenAI Base URL');
-      } else {
-        window.__wb2aCopyText?.('$env:ANTHROPIC_BASE_URL="http://127.0.0.1:' + PORT + '" ; $env:ANTHROPIC_API_KEY="sk-local"', 'Claude Code 环境变量');
+        text = 'http://127.0.0.1:' + PORT + '/v1';
+        label = 'OpenAI Base URL';
+      } else if (kind === 'claude') {
+        text = '$env:ANTHROPIC_BASE_URL="http://127.0.0.1:' + PORT + '" ; $env:ANTHROPIC_API_KEY="sk-local"';
+        label = 'Claude Code 环境变量';
+      } else if (kind === 'codex') {
+        text = 'http://127.0.0.1:' + PORT + '/v1/responses';
+        label = 'Codex Responses URL';
+      }
+      window.__wb2aCopyText?.(text, label);
+      if (btnEl) {
+        const orig = btnEl.innerHTML;
+        btnEl.innerHTML = '✓ 已复制';
+        btnEl.style.color = 'var(--green)';
+        btnEl.style.borderColor = '#a7f3d0';
+        setTimeout(() => {
+          btnEl.innerHTML = orig;
+          btnEl.style.color = '';
+          btnEl.style.borderColor = '';
+        }, 1800);
       }
     }
 

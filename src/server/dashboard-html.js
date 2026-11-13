@@ -52,6 +52,8 @@ const SHARED_CSS = `
   .container { max-width: 1300px; margin: 0 auto; padding: 20px 24px 64px; }
   .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 18px; }
   .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; margin-bottom: 18px; }
+  .guide-card { border: 1px solid #dbe5f1; border-radius: 10px; padding: 12px; background: #f8fafc; transition: all 0.2s; }
+  .guide-card:hover { border-color: #93c5fd; }
   .card {
     background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 18px; box-shadow: 0 4px 16px rgba(15, 35, 75, 0.05); margin-bottom: 16px;
@@ -663,6 +665,19 @@ export function renderConsoleHtml(opts = {}) {
         <div id="guideCardsGrid" class="grid-2" style="margin-bottom:0"></div>
       </div>
     </div>
+
+    <!-- 底部专属品牌状态与快速链接 -->
+    <footer style="margin-top:24px;padding:16px 4px 8px;border-top:1px solid #dbe5f1;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--text-dim)">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-weight:700;color:var(--blue)">⚡ WorkBuddy 2API</span>
+        <span>· 企业级高并发多账号轮询与模型聚合网关</span>
+      </div>
+      <div style="display:flex;gap:14px;align-items:center">
+        <a href="/healthz" target="_blank" style="color:var(--blue);text-decoration:none">健康探针 (/healthz)</a>
+        <a href="/portal" target="_blank" style="color:var(--blue);text-decoration:none">公开门户 (/portal)</a>
+        <a href="https://github.com/XCool-603/dsh-workbuddy2api" target="_blank" style="color:var(--text-dim);text-decoration:none">GitHub 仓库 ↗</a>
+      </div>
+    </footer>
   </div>
 
   <!-- MODALS -->
@@ -1647,26 +1662,39 @@ export function renderConsoleHtml(opts = {}) {
       if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast('已复制 ' + label)).catch(() => {});
     }
     let _guideCopyList = [];
-    function copyGuide(idx) {
+    function copyGuide(idx, btnEl) {
       const item = _guideCopyList[idx];
-      if (item) copyText(item.copy, item.title);
+      if (item) {
+        copyText(item.copy, item.title);
+        if (btnEl) {
+          const orig = btnEl.innerHTML;
+          btnEl.innerHTML = '✓ 已复制';
+          btnEl.style.color = '#059669';
+          btnEl.style.borderColor = '#a7f3d0';
+          setTimeout(() => {
+            btnEl.innerHTML = orig;
+            btnEl.style.color = '';
+            btnEl.style.borderColor = '';
+          }, 1800);
+        }
+      }
     }
 
     function renderGuideCards(base) {
       const el = document.getElementById('guideCardsGrid'); if (!el) return;
       _guideCopyList = [
-        { title: 'OpenAI Chat 协议 (Cline / Cherry / Roo)', val: base + '/v1', copy: base + '/v1', tip: 'Base URL 填入此地址，Key 留空或填配置值；加 ?bare=true 返回无前缀模型名' },
+        { title: 'OpenAI Chat 协议 (Cline / Cherry / Roo / Cursor)', val: base + '/v1', copy: base + '/v1', tip: 'Base URL 填入此地址，Key 留空或填配置值；加 ?bare=true 返回无前缀模型名' },
         { title: 'Claude Code CLI (Anthropic /v1/messages)', val: 'ANTHROPIC_BASE_URL=' + base, copy: '$env:ANTHROPIC_BASE_URL="' + base + '" ; $env:ANTHROPIC_API_KEY="sk-local"', tip: '支持 count_tokens 与流式错帧，建议在「模型与别名」中开启 Claude Code 映射' },
         { title: 'Codex CLI (OpenAI Responses /v1/responses)', val: base + '/v1/responses', copy: base + '/v1', tip: '原生支持 reasoning_effort 与 tool_call 转换，Base URL 同填 /v1' },
         { title: '健康探针 / 公开状态与视频生成', val: base + '/healthz', copy: base + '/healthz', tip: '视频生成: ' + base + '/v1/videos/generations · 公开门户: ' + base + '/portal' }
       ];
       el.innerHTML = _guideCopyList.map((c, idx) =>
-        '<div style="border:1px solid #dbe5f1;border-radius:10px;padding:12px;background:#f8fafc">' +
+        '<div class="guide-card">' +
           '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
             '<strong style="font-size:12px;color:#1e3a8a">' + escapeHtml(c.title) + '</strong>' +
-            '<button class="btn btn-sm" onclick="copyGuide(' + idx + ')">复制</button>' +
+            '<button class="btn btn-sm" onclick="copyGuide(' + idx + ', this)">📋 复制</button>' +
           '</div>' +
-          '<div style="font-family:Consolas,monospace;font-size:11px;color:#2563eb;word-break:break-all;margin-bottom:4px">' + escapeHtml(c.val) + '</div>' +
+          '<div style="font-family:Consolas,monospace;font-size:11px;color:#2563eb;word-break:break-all;margin-bottom:5px;background:#ffffff;padding:4px 8px;border-radius:6px;border:1px solid #e2e8f0">' + escapeHtml(c.val) + '</div>' +
           '<div style="font-size:11px;color:#64748b">' + escapeHtml(c.tip) + '</div>' +
         '</div>'
       ).join('');

@@ -527,6 +527,13 @@ export class LoopbackGateway {
     const cnCounts = this.scheduler.getCountsDetailed('cn');
     const globalCounts = this.scheduler.getCountsDetailed('global');
     const stats = this.ledger.getStats(this.getModelCatalogMap());
+    let totalRemain = 0;
+    for (const acc of allAcc) {
+      const cred = typeof acc.balance?.remain === 'number'
+        ? acc.balance.remain
+        : (typeof acc.remainCredits === 'number' ? acc.remainCredits : 0);
+      totalRemain += cred;
+    }
 
     return {
       status: overall.healthy > 0 ? 'ok' : 'degraded',
@@ -539,6 +546,7 @@ export class LoopbackGateway {
       disabled: overall.disabled,
       manual_disabled: overall.manualDisabled,
       in_flight_full: overall.inFlightFull,
+      remain: totalRemain,
       realm_totals: { cn: cnCounts, global: globalCounts },
       sticky_sessions: this.scheduler.stickyMap.size,
       discoveredModels: this.discoveredModels.length,

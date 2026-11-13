@@ -2214,19 +2214,27 @@ export function SettingsCard({ t }) {
             <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>🔌 其他 IDE / CLI 一键接入卡片 (Claude Code · Codex · Cline · Cursor)</div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               {[
-                { title: 'OpenAI Chat 兼容 (Cline/Cherry/Roo)', val: gatewayUrl, copy: gatewayUrl },
+                { title: 'OpenAI Chat 兼容 (Cline/Cherry/Roo/Cursor)', val: gatewayUrl, copy: gatewayUrl },
                 { title: 'Claude Code CLI (Anthropic)', val: `http://127.0.0.1:${port}`, copy: `$env:ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" ; $env:ANTHROPIC_API_KEY="sk-local"` },
                 { title: 'Codex Responses API', val: `http://127.0.0.1:${port}/v1/responses`, copy: gatewayUrl },
                 { title: '独立 Console / 公开 Portal', val: consoleUrl, copy: consoleUrl }
               ].map((c, idx) => (
-                <div key={idx} style={{ background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 8, padding: '8px 10px' }}>
+                <div key={idx} style={{ background: '#f8fafc', border: '1px solid #dbe5f1', borderRadius: 8, padding: '8px 10px', transition: 'all 0.2s' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                     <strong style={{ fontSize: 11, color: '#1e3a8a' }}>{c.title}</strong>
-                    <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" style={{ padding: '1px 6px', fontSize: 10 }} onClick={() => copyText(c.copy, c.title)}>复制</button>
+                    <button className="wb2a-btn wb2a-btn-secondary wb2a-btn-sm" style={{ padding: '2px 7px', fontSize: 10 }} onClick={() => copyText(c.copy, c.title)}>📋 复制</button>
                   </div>
-                  <div style={{ fontFamily: 'Consolas, monospace', fontSize: 10, color: '#2563eb', wordBreak: 'break-all' }}>{c.val}</div>
+                  <div style={{ fontFamily: 'Consolas, monospace', fontSize: 10.5, color: '#2563eb', wordBreak: 'break-all', background: '#ffffff', padding: '3px 6px', borderRadius: 5, border: '1px solid #e2e8f0' }}>{c.val}</div>
                 </div>
               ))}
+            </div>
+          </div>
+
+          <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: '#64748b' }}>
+            <span>⚡ WorkBuddy 2API · 多账号模型调度网关</span>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <a href={`http://127.0.0.1:${port}/healthz`} target="_blank" rel="noreferrer" style={{ color: '#2563eb', textDecoration: 'none' }}>健康探针</a>
+              <a href={`http://127.0.0.1:${port}/portal`} target="_blank" rel="noreferrer" style={{ color: '#2563eb', textDecoration: 'none' }}>公开门户</a>
             </div>
           </div>
         </div>
