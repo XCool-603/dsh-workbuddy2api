@@ -166,19 +166,27 @@ function stripComments(text) {
 export function normalizeAccountObject(raw, defaultRealm = 'global') {
   if (!raw || typeof raw !== 'object') return null;
 
-  const accessToken =
+  let accessToken =
     raw.auth?.accessToken ||
     raw.auth?.access_token ||
     raw.accessToken ||
     raw.access_token ||
     raw.token ||
     '';
-  const refreshToken =
+  let refreshToken =
     raw.auth?.refreshToken ||
     raw.auth?.refresh_token ||
     raw.refreshToken ||
     raw.refresh_token ||
     '';
+
+  // 严禁将网页 OAuth 授权跳转 URL 误当作 Token 入池
+  if (accessToken && (accessToken.startsWith('http://') || accessToken.startsWith('https://'))) {
+    accessToken = '';
+  }
+  if (refreshToken && (refreshToken.startsWith('http://') || refreshToken.startsWith('https://'))) {
+    refreshToken = '';
+  }
 
   if (!accessToken && !refreshToken) return null;
 
@@ -287,7 +295,7 @@ export function extractAccountCandidates(input, defaultRealm = 'global') {
   // 3. 逐行识别（NDJSON / 单行 JSON 数组 / 卡密文本 access----refresh / token:refresh / 裸 token）
   for (const rawLine of clean.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line) continue;
+    if (!line || line.startsWith('http://') || line.startsWith('https://')) continue;
 
     if (line.startsWith('{') || line.startsWith('[')) {
       try {
